@@ -1,0 +1,733 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenCode PACT 与 Humanize/RLCR 对齐审计</title>
+  <style>
+    :root {
+      --ink: #17202a;
+      --muted: #5f6b7a;
+      --line: #d9e0ea;
+      --panel: #f7f9fc;
+      --panel-2: #eef4ff;
+      --good: #0f7b4f;
+      --partial: #a36100;
+      --risk: #b42318;
+      --accent: #2251a4;
+      --code: #263142;
+      --bg: #ffffff;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 36px 28px 72px;
+    }
+
+    h1, h2, h3 {
+      line-height: 1.25;
+      margin: 0;
+      color: #101828;
+    }
+
+    h1 {
+      font-size: 32px;
+      margin-bottom: 10px;
+    }
+
+    h2 {
+      font-size: 24px;
+      margin-top: 38px;
+      padding-top: 20px;
+      border-top: 1px solid var(--line);
+    }
+
+    h3 {
+      font-size: 18px;
+      margin-top: 24px;
+    }
+
+    p {
+      margin: 10px 0;
+    }
+
+    code {
+      color: var(--code);
+      background: #edf1f7;
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      background: #101828;
+      color: #f7f9fc;
+      padding: 14px 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0 24px;
+      table-layout: fixed;
+    }
+
+    th, td {
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: #edf2f8;
+      font-weight: 650;
+    }
+
+    td {
+      background: #fff;
+    }
+
+    ul {
+      margin: 8px 0 18px 22px;
+      padding: 0;
+    }
+
+    li {
+      margin: 5px 0;
+    }
+
+    .lede {
+      color: var(--muted);
+      font-size: 16px;
+      max-width: 900px;
+    }
+
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin: 22px 0 26px;
+    }
+
+    .meta div,
+    .note,
+    .finding {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+
+    .note {
+      margin: 16px 0;
+    }
+
+    .score {
+      display: grid;
+      grid-template-columns: 1.2fr 2fr;
+      gap: 18px;
+      margin-top: 18px;
+      align-items: stretch;
+    }
+
+    .score-number {
+      background: var(--panel-2);
+      border: 1px solid #b9cff8;
+      border-radius: 8px;
+      padding: 18px;
+    }
+
+    .score-number strong {
+      display: block;
+      font-size: 44px;
+      color: var(--accent);
+      line-height: 1;
+      margin-bottom: 8px;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+
+    .ok {
+      color: var(--good);
+      background: #e8f6ef;
+    }
+
+    .partial {
+      color: var(--partial);
+      background: #fff4df;
+    }
+
+    .risk {
+      color: var(--risk);
+      background: #fff0ee;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+      margin: 16px 0 22px;
+    }
+
+    .step {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fff;
+      min-height: 112px;
+    }
+
+    .step b {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--accent);
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .nowrap {
+      white-space: nowrap;
+    }
+
+    @media (max-width: 840px) {
+      main {
+        padding: 24px 16px 54px;
+      }
+
+      .meta,
+      .score,
+      .two-col,
+      .flow {
+        grid-template-columns: 1fr;
+      }
+
+      table {
+        display: block;
+        overflow-x: auto;
+        table-layout: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>OpenCode PACT 与 Humanize/RLCR 对齐审计</h1>
+  <p class="lede">
+    这份文档基于当前 OpenCode PACT plugin 代码、设计文档、上一轮 LoLBench Docker smoke 的真实产物和 agent trajectory，
+    评估它是否已经基本对齐 Humanize/RLCR 的核心机制，并整理当前具体流程、每步输入输出以及落盘可观测文件。
+  </p>
+
+  <div class="meta">
+    <div><b>审计日期</b><br>2026-06-23</div>
+    <div><b>OpenCode worktree</b><br><code>/Users/gujiazhen/Documents/cc_codes/opencode/.worktrees/pact-observability-replay-v1</code></div>
+    <div><b>上一轮 smoke 输出</b><br><code>/Users/gujiazhen/Documents/cc_codes/outputs/opencode_pact_lolbench_docker_smoke_fix_20260623T054349Z</code></div>
+    <div><b>被测 LoLBench case</b><br><code>CPython_PEP-680_tomllib-Support-for-Parsing-TOML-in-the-Standard-Library_PR-31498</code></div>
+  </div>
+
+  <section>
+    <h2>一、结论</h2>
+    <div class="score">
+      <div class="score-number">
+        <strong>基本对齐</strong>
+        <p>约 <b>70-75%</b> 对齐 Humanize/RLCR 的控制模型。</p>
+        <p class="small">这里评估的是机制对齐，不是 worker 解题质量。</p>
+      </div>
+      <div class="finding">
+        <p>
+          当前 OpenCode PACT 已经具备 Humanize/RLCR 的主干：强结构 plan/todo/goal tracker、受保护 ledger、
+          reviewer gate、多轮 continuation、implementation -> review -> finalize phase、patch/review/result/replay artifact chain。
+        </p>
+        <p>
+          主要差距集中在 Humanize 更强的运行时控制与审计细节：没有 Claude Code Stop Hook 等价的硬阻塞、
+          没有原始 worker trajectory artifact、没有 Codex usage 账本、没有 evidence bundle 和 per-round history repo commit，
+          goal tracker 更新也还比较轻量。
+        </p>
+      </div>
+    </div>
+
+    <div class="note">
+      <b>上一轮 smoke 的机制结论：</b>
+      PACT loop 确实推进了 4 个完整 review-gated round，并进入第 5 轮 finalize prompt。
+      LoLBench 外层 1500s timeout 截断了 finalize round，所以最终 loop 被标记为 <code>status=stopped</code>、
+      <code>phase=stopped</code>、<code>failure_category=agent_timeout</code>。
+      这说明 loop 机制可跑通，但 finalize 还需要更好的外层超时预算或更短 finalize prompt。
+    </div>
+  </section>
+
+  <section>
+    <h2>二、上一轮 smoke 轨迹摘要</h2>
+    <table>
+      <thead>
+        <tr>
+          <th style="width: 90px;">Round</th>
+          <th>阶段</th>
+          <th>Reviewer 决策</th>
+          <th>输出/状态变化</th>
+          <th>可观测证据</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>01</code></td>
+          <td>implementation</td>
+          <td><span class="badge partial">continue</span>，缺 final marker，解析为 <code>implicit_continue</code></td>
+          <td>生成 continuation feedback，进入 round 02。</td>
+          <td><code>round-01-summary.md</code>、<code>round-01-review.md</code>、<code>round-01-result.json</code>、<code>round-01-events.jsonl</code>；eval patch 782 行，tool event 135。</td>
+        </tr>
+        <tr>
+          <td><code>02</code></td>
+          <td>implementation</td>
+          <td><span class="badge partial">continue</span>，解析为 <code>implicit_continue</code></td>
+          <td>继续修复 array-of-tables 等问题，进入 round 03。</td>
+          <td><code>round-02-feedback.md</code>、<code>round-02-prompt.md</code>、<code>round-02-patch-artifact.json</code>；eval patch 849 行。</td>
+        </tr>
+        <tr>
+          <td><code>03</code></td>
+          <td>implementation</td>
+          <td><span class="badge ok">PACT_COMPLETE</span></td>
+          <td>没有直接 complete，而是进入 Humanize-like review phase。</td>
+          <td><code>round-03-review-decision.json</code> 记录 <code>resulting_phase=review</code>；<code>round-04-prompt.md</code> 是 code-review checkpoint。</td>
+        </tr>
+        <tr>
+          <td><code>04</code></td>
+          <td>review</td>
+          <td><span class="badge ok">PACT_COMPLETE</span></td>
+          <td>进入 finalize phase，并写出 finalize prompt。</td>
+          <td><code>round-04-review-decision.json</code> 记录 <code>resulting_phase=finalize</code>；<code>replay-case.json</code> 指向 round 04。</td>
+        </tr>
+        <tr>
+          <td><code>05</code></td>
+          <td>finalize</td>
+          <td><span class="badge risk">未完成</span></td>
+          <td>外层 LoLBench timeout 截断；helper 将 loop 标记 stopped 并归档 artifacts。</td>
+          <td>存在 <code>round-05-prompt.md</code>、<code>round-05-context.json</code>、<code>round-05-events.jsonl</code>、<code>round-05-result.json</code>；缺 <code>finalize-summary.md</code>。</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="two-col">
+      <div class="note">
+        <b>Benchmark 结果</b>
+        <p>
+          <code>summary.json</code> 显示 1 个实例，orig suite resolved 0/1。
+          <code>agent_report.json</code> 显示 patch 可应用且 build ok，但 F2P 13 个全 errored，P2P 42/42 passed。
+        </p>
+      </div>
+      <div class="note">
+        <b>机制与质量分离</b>
+        <p>
+          worker 没解出 CPython tomllib case 是解题质量问题；PACT 机制侧已经完成多轮 reviewer gate、
+          phase transition、patch pollution 防护和 artifact 归档。
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>三、当前具体流程</h2>
+    <div class="flow">
+      <div class="step"><b>1. Loop Start</b>输入 plan、max rounds、planner/reviewer/worker 配置；创建 loop manifest、state、plan/todo/goal tracker。</div>
+      <div class="step"><b>2. Worker Round</b>OpenCode worker 读 round prompt，修改代码，写 summary；plugin 记录 tool events。</div>
+      <div class="step"><b>3. Patch Capture</b>idle 时捕获 workspace/eval patch，排除 PACT 与 benchmark scaffolding。</div>
+      <div class="step"><b>4. Reviewer Gate</b>Codex reviewer 读 summary、eval patch、metadata，输出 review；只认 final PACT_COMPLETE。</div>
+      <div class="step"><b>5. Continue/Phase</b>continue 生成下一轮 prompt；complete 进入 review/finalize；finalize summary 后 complete。</div>
+    </div>
+
+    <h3>1. LoLBench/OpenCode smoke 启动</h3>
+    <table>
+      <thead>
+        <tr><th>输入</th><th>处理</th><th>输出</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>
+            LoLBench <code>PROMPT.md</code>、目标 repo workspace、worker model、PACT plugin config。
+          </td>
+          <td>
+            smoke 路径使用 <code>pact-run-driver.ts</code> 多次调用 <code>opencode run</code>。
+            第一次 prompt 要求调用 <code>pact-start-loop</code>，后续如果 state 仍 running，则用
+            <code>-s active_session_id</code> 回到同一个 session，并把 <code>round-XX-prompt.md</code> 作为输入。
+          </td>
+          <td>
+            OpenCode session、PACT loop、agent log、LoLBench run dir。
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>2. <code>pact-start-loop</code> 初始化</h3>
+    <table>
+      <thead>
+        <tr><th>输入</th><th>核心行为</th><th>落盘文件</th><th>后续作用</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>
+            <code>plan_file</code>、<code>max_rounds</code>、<code>full_alignment_interval</code>、
+            planner/reviewer/worker backend 与 model。
+          </td>
+          <td>
+            拷贝原始 plan；Codex planner 默认 <code>gpt-5.5</code> 生成/规范化 todo 和 goal tracker；
+            初始化 state；把 <code>.pact/</code> 幂等加入 workspace 的 <code>.git/info/exclude</code>。
+          </td>
+          <td>
+            <code>loop-manifest.json</code>、<code>state.json</code>、<code>plan.md</code>、
+            <code>todo.md</code>、<code>goal-tracker.md</code>、<code>round-01-prompt.md</code>、
+            <code>round-01-state.json</code>、<code>round-01-context.json</code>、<code>round-01-events.jsonl</code>。
+          </td>
+          <td>
+            形成可复盘的 loop identity、模型配置、目标快照、任务账本和第一轮 worker prompt。
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>3. Worker 执行与 tool/session events</h3>
+    <table>
+      <thead>
+        <tr><th>输入</th><th>核心行为</th><th>落盘文件</th><th>后续作用</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>
+            <code>round-XX-prompt.md</code>、<code>todo.md</code>、<code>goal-tracker.md</code>、上一轮 <code>feedback.md</code>。
+          </td>
+          <td>
+            worker 修改代码并写 <code>round-XX-summary.md</code>。
+            plugin 对 tool before/after 记录轻量摘要；只拦截写操作保护 ledger；
+            <code>benchmarkStrictNetwork</code> 可拦截明显访问 GitHub/python.org/PyPI 等 benchmark source 的工具调用。
+          </td>
+          <td>
+            <code>round-XX-summary.md</code>、<code>round-XX-events.jsonl</code>，以及 workspace 里的业务代码改动。
+          </td>
+          <td>
+            summary 是 reviewer gate 的主输入；events 用于观测工具调用密度和被拦截行为。
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>4. Patch Capture</h3>
+    <table>
+      <thead>
+        <tr><th>输入</th><th>核心行为</th><th>落盘文件</th><th>后续作用</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>
+            当前 git workspace、root <code>solution.patch</code>、root <code>test.patch</code>。
+          </td>
+          <td>
+            捕获 <code>workspace.patch</code> 和 <code>eval.patch</code>。
+            两者都排除 <code>.pact/**</code>、root <code>solution.patch</code>、root <code>test.patch</code>；
+            <code>eval.patch</code> 还排除 root <code>test.patch</code> 内声明的测试文件。
+          </td>
+          <td>
+            <code>round-XX-workspace.patch</code>、<code>round-XX-eval.patch</code>、
+            <code>round-XX-patch-artifact.json</code>。
+          </td>
+          <td>
+            reviewer 只看 eval patch；workspace patch 保留更完整可观测性。
+            patch artifact 记录 changed files、sha、bytes、lines、apply check、被排除 scaffolding/test 文件元数据。
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>5. Reviewer Gate</h3>
+    <table>
+      <thead>
+        <tr><th>输入</th><th>核心行为</th><th>落盘文件</th><th>后续作用</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>
+            plan、todo、goal tracker、round summary、eval patch、patch metadata。
+          </td>
+          <td>
+            默认同步调用 <code>codex exec --ignore-user-config --skip-git-repo-check -m gpt-5.4-mini -c model_reasoning_effort="medium" -C &lt;projectRoot&gt; -</code>。
+            reviewer 输出固定短结构。只有最后一个非空行是 <code>PACT_COMPLETE</code> 才算 complete；
+            <code>PACT_STOP</code>、<code>PACT_CONTINUE</code> 和缺 marker 都视为 continue。
+          </td>
+          <td>
+            <code>round-XX-review-prompt.md</code>、<code>round-XX-review.md</code>、
+            <code>round-XX-feedback.md</code>、<code>round-XX-review-decision.json</code>。
+          </td>
+          <td>
+            形成机器可读 gate 结果；continue feedback 会进入下一轮 prompt；
+            complete 会触发 phase transition。
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>6. Phase Transition 与收口</h3>
+    <table>
+      <thead>
+        <tr><th>当前 phase</th><th>reviewer marker</th><th>下一步</th><th>落盘文件</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>implementation</code></td>
+          <td><code>continue</code></td>
+          <td>当前 round + 1，生成 continuation prompt。</td>
+          <td><code>round-(XX+1)-prompt.md</code>、state/context/events。</td>
+        </tr>
+        <tr>
+          <td><code>implementation</code> 或 <code>full_alignment</code></td>
+          <td><code>PACT_COMPLETE</code></td>
+          <td>进入 <code>review</code> phase，而不是直接 complete。</td>
+          <td><code>round-XX-feedback.md</code> 写 review phase 指令；下一轮 prompt 为 code-review checkpoint。</td>
+        </tr>
+        <tr>
+          <td><code>review</code></td>
+          <td><code>PACT_COMPLETE</code></td>
+          <td>进入 <code>finalize</code> phase。</td>
+          <td><code>round-XX-feedback.md</code> 写 finalize 指令；下一轮 prompt 要求写 <code>finalize-summary.md</code>。</td>
+        </tr>
+        <tr>
+          <td><code>finalize</code></td>
+          <td>不再跑 reviewer；等待 summary</td>
+          <td>发现 <code>finalize-summary.md</code> 后写 complete state。</td>
+          <td><code>complete-state.md</code>、最终 <code>round-XX-result.json</code>。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>四、可观测文件清单</h2>
+    <table>
+      <thead>
+        <tr><th style="width: 240px;">文件</th><th>内容</th><th>后续用途</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>loop-manifest.json</code></td><td>loop id、project root、plan sha、max rounds、phase config、planner/reviewer/worker backend/model、base commit。</td><td>全局 provenance；判断本轮跑法和模型配置。</td></tr>
+        <tr><td><code>state.json</code></td><td>当前 status、phase、round、active session、last review/feedback、goal tracker immutable hash。</td><td>driver 续跑和事件 hook 判断下一步。</td></tr>
+        <tr><td><code>plan.md</code></td><td>原始需求/计划快照。</td><td>replay、review、goal tracker 来源。</td></tr>
+        <tr><td><code>todo.md</code></td><td>从 plan 派生的 task ledger，包含 task id、target AC、tag、依赖、状态。</td><td>worker 每轮选择下一步任务。</td></tr>
+        <tr><td><code>goal-tracker.md</code></td><td>Humanize-like immutable/mutable section：Ultimate Goal、AC、active/completed/deferred/open issues/evolution。</td><td>长周期记忆和任务状态锚点。</td></tr>
+        <tr><td><code>round-XX-prompt.md</code></td><td>本轮 worker prompt；包含初始任务、continuation、review phase 或 finalize phase 指令。</td><td>driver re-enter session 的输入；replay 输入。</td></tr>
+        <tr><td><code>round-XX-context.json</code></td><td>session id、worker/reviewer/planner 元数据、prompt/todo/goal tracker/feedback 路径与 hash。</td><td>重放和审计每轮输入上下文。</td></tr>
+        <tr><td><code>round-XX-state.json</code></td><td>round 级 phase/status 快照。</td><td>定位 round 在何处开始/结束/失败。</td></tr>
+        <tr><td><code>round-XX-events.jsonl</code></td><td>round_started、tool_before/after、patch_captured、review_started/finished、round_finished、replay_exported 等摘要事件。</td><td>轻量 trajectory；统计 tool event count；排查 blocked network 或缺 summary。</td></tr>
+        <tr><td><code>round-XX-summary.md</code></td><td>worker 自述：做了什么、验证了什么、遗留什么、是否请求 goal tracker 更新。</td><td>reviewer 主输入；下一轮 context。</td></tr>
+        <tr><td><code>round-XX-workspace.patch</code></td><td>完整 workspace diff，排除 PACT 和 root scaffolding。</td><td>可观测完整改动，包含测试文件。</td></tr>
+        <tr><td><code>round-XX-eval.patch</code></td><td>benchmark 提交 patch，排除测试 patch 声明文件。</td><td>reviewer 和 LoLBench 最终评价的业务 patch。</td></tr>
+        <tr><td><code>round-XX-patch-artifact.json</code></td><td>workspace/eval patch metadata、changed files、sha、bytes、lines、apply check、excluded scaffolding/test files。</td><td>patch pollution 排查、LoLBench artifact coverage、replay。</td></tr>
+        <tr><td><code>round-XX-review-prompt.md</code></td><td>实际发给 Codex reviewer 的 prompt。</td><td>reviewer 调用可复盘；便于 prompt 迭代。</td></tr>
+        <tr><td><code>round-XX-review.md</code></td><td>reviewer markdown 输出，固定短结构。</td><td>人类阅读和 feedback 来源。</td></tr>
+        <tr><td><code>round-XX-feedback.md</code></td><td>给 worker 下一轮读取的反馈，complete 时写 phase transition 指令。</td><td>continuation/review/finalize prompt 的输入。</td></tr>
+        <tr><td><code>round-XX-review-decision.json</code></td><td>marker、parse_status、terminal_line、backend/model、resulting status/phase。</td><td>机器可读 gate 结果。</td></tr>
+        <tr><td><code>round-XX-result.json</code></td><td>status、loop_phase、failure_category、模型元数据、metrics、artifact paths。</td><td>结果聚合、失败分类、LoLBench 产物审计。</td></tr>
+        <tr><td><code>replay-case.json</code></td><td>最近一次成功导出的 replay case，包含 plan/prompt/context/patch/review/result 摘要。</td><td>checkpoint replay 和未来 A/B。当前是 loop-level latest，会被后续 round 覆盖。</td></tr>
+        <tr><td><code>complete-state.md</code> / <code>stop-state.md</code></td><td>complete 或 stopped 的人类可读终态说明。</td><td>快速判断 loop 如何收口。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>五、与 Humanize/RLCR 的对齐矩阵</h2>
+    <table>
+      <thead>
+        <tr><th>Humanize/RLCR 机制</th><th>OpenCode PACT 当前状态</th><th>对齐度</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>强约束 plan contract</td>
+          <td>Codex planner + deterministic fallback 会生成 AC/task ledger。</td>
+          <td><span class="badge partial">部分对齐</span></td>
+          <td>Humanize 的 <code>gen-plan</code> schema 更完整：positive/negative tests、path boundaries、pending decisions 等更强。LoLBench 原始 prompt 通常不是完整 Humanize plan。</td>
+        </tr>
+        <tr>
+          <td>plan -> goal tracker 投影</td>
+          <td>loop start 生成 <code>todo.md</code> 和 <code>goal-tracker.md</code>，含 immutable/mutable section。</td>
+          <td><span class="badge ok">基本对齐</span></td>
+          <td>OpenCode 用 planner/fallback 在 round 1 前完成投影；Humanize 更像 Round 0 agent 初始化。</td>
+        </tr>
+        <tr>
+          <td>受保护 goal tracker</td>
+          <td>写工具保护 ledger 文件，并用 immutable hash 检查 goal tracker immutable section。</td>
+          <td><span class="badge ok">基本对齐</span></td>
+          <td>当前只拦写，不拦读，已避免 worker 读不到 feedback 的问题。</td>
+        </tr>
+        <tr>
+          <td>reviewer gate</td>
+          <td>默认同步 Codex CLI reviewer，固定 prompt 输出结构，review 失败/timeout 有 artifact。</td>
+          <td><span class="badge ok">基本对齐</span></td>
+          <td>上一轮 smoke 证明 reviewer 可连续 gate 4 轮。</td>
+        </tr>
+        <tr>
+          <td>二态 reviewer protocol</td>
+          <td>仅 final <code>PACT_COMPLETE</code> 完成；其他均 continue。</td>
+          <td><span class="badge ok">对齐</span></td>
+          <td>兼容 deprecated <code>PACT_STOP</code>，不再把它当终止信号。</td>
+        </tr>
+        <tr>
+          <td>Stop Hook 硬门禁</td>
+          <td>OpenCode 没有等价 Stop Hook；使用 <code>session.idle</code> 近似。</td>
+          <td><span class="badge risk">未完全对齐</span></td>
+          <td>这是机制能力差异。worker 退出后由 idle hook 继续推动，不是像 Claude Code Stop Hook 那样硬阻止退出。</td>
+        </tr>
+        <tr>
+          <td>多轮 continuation</td>
+          <td><code>pact-run-driver</code> 读取 state 和 <code>round-XX-prompt.md</code>，复用 active session。</td>
+          <td><span class="badge ok">基本对齐</span></td>
+          <td>上一轮 smoke 的 round 1 -> 4 证明可工作。</td>
+        </tr>
+        <tr>
+          <td>full alignment checkpoint</td>
+          <td>代码已实现 interval 触发和 prompt，但上一轮 smoke 未实际触发。</td>
+          <td><span class="badge partial">部分对齐</span></td>
+          <td>因为 implementation 在 round 3 已 complete，round 5 已是 finalize，所以 <code>full_alignment_interval=5</code> 未覆盖真实 round。</td>
+        </tr>
+        <tr>
+          <td>review phase</td>
+          <td>implementation complete 后进入 review phase，round 04 执行 code-review checkpoint。</td>
+          <td><span class="badge ok">对齐</span></td>
+          <td>smoke 中 <code>round-03-review-decision.json</code> 明确 <code>resulting_phase=review</code>。</td>
+        </tr>
+        <tr>
+          <td>finalize phase</td>
+          <td>review complete 后进入 finalize phase，生成 round 05 finalize prompt。</td>
+          <td><span class="badge partial">部分对齐</span></td>
+          <td>机制已到位，但上一轮被外层 timeout 截断，没有 <code>finalize-summary.md</code> 和 <code>complete-state.md</code>。</td>
+        </tr>
+        <tr>
+          <td>每轮 trajectory</td>
+          <td>有 <code>round-XX-events.jsonl</code> 和 LoLBench <code>agent.log</code>，但没有 Humanize-style raw worker trajectory artifact。</td>
+          <td><span class="badge partial">部分对齐</span></td>
+          <td>Humanize 每轮保存 <code>trajectory.json</code>、metadata、git snapshot、evidence bundle，OpenCode 目前是摘要级。</td>
+        </tr>
+        <tr>
+          <td>Codex usage/token 账本</td>
+          <td>暂未记录 planner/reviewer usage。</td>
+          <td><span class="badge risk">未对齐</span></td>
+          <td>Humanize 记录 codex usage log 和 summary；OpenCode 可以后续从 Codex JSON output 或 CLI telemetry 补。</td>
+        </tr>
+        <tr>
+          <td>artifact/replay</td>
+          <td>有完整 JSON/patch/review/result/replay chain。</td>
+          <td><span class="badge ok">基本对齐</span></td>
+          <td>OpenCode 在 replay 方面比最初 Humanize-like 控制更结构化；但 <code>replay-case.json</code> 是 latest 覆盖，不是 per-round archive。</td>
+        </tr>
+        <tr>
+          <td>patch 边界与 benchmark scaffolding</td>
+          <td>排除 <code>.pact/**</code>、root <code>solution.patch</code>、root <code>test.patch</code>，并记录被排除元数据。</td>
+          <td><span class="badge ok">对齐且适配 LoLBench</span></td>
+          <td>上一轮最终 <code>solution.patch</code> 未污染 PACT artifacts。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>六、当前缺口与建议</h2>
+    <table>
+      <thead>
+        <tr><th style="width: 100px;">优先级</th><th>缺口</th><th>建议</th><th>预期收益</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span class="badge risk">P0</span></td>
+          <td>finalize phase 被外层 timeout 截断，导致机制未完整展示 complete 收口。</td>
+          <td>给 finalize round 更短 prompt/更小任务边界，或在 driver/LoLBench 层给进入 finalize 后的最后一次 invocation 单独预算；smoke 可用更小 case 或更短 max rounds 验证 complete path。</td>
+          <td>证明完整 implementation -> review -> finalize -> complete 链路。</td>
+        </tr>
+        <tr>
+          <td><span class="badge partial">P1</span></td>
+          <td>full alignment 已实现但上一轮未触发。</td>
+          <td>增加一个 <code>full_alignment_interval=2</code> 的 smoke，或加显式 force-full-alignment 测试入口。</td>
+          <td>验证 Humanize 的“周期性全局对齐”机制真实可用。</td>
+        </tr>
+        <tr>
+          <td><span class="badge partial">P1</span></td>
+          <td>没有 Humanize-style raw trajectory、usage、evidence bundle、history repo commit。</td>
+          <td>增加 <code>round-XX-trajectory.json</code> 或至少保存 OpenCode session export；记录 planner/reviewer Codex usage；生成 <code>round-XX-evidence.md/json</code>；可选维护 <code>.round-history</code>。</td>
+          <td>可观测性从“摘要级”提升到“复盘级”。</td>
+        </tr>
+        <tr>
+          <td><span class="badge partial">P1</span></td>
+          <td>continue round 的 <code>failure_category</code> 当前是 <code>unknown</code>。</td>
+          <td>将正常继续分类成 <code>needs_continuation</code> 或令 failure 为 null，并增加 <code>review_outcome=continue</code>。</td>
+          <td>结果聚合更干净，避免把正常 reviewer feedback 误读为异常。</td>
+        </tr>
+        <tr>
+          <td><span class="badge partial">P2</span></td>
+          <td>goal tracker 更新还偏轻量，主要 append reviewer-approved note。</td>
+          <td>把 Goal Tracker Update Request 解析成结构化表格操作：active -> completed/deferred/open issue/evolution。</td>
+          <td>更接近 Humanize 把 tracker 当 durable state machine 的设计。</td>
+        </tr>
+        <tr>
+          <td><span class="badge partial">P2</span></td>
+          <td><code>lolbench-smoke.ts</code> 目前更像配置 helper，尚未完全接成通用 smoke CLI。</td>
+          <td>把 ZAI env loading、provider config merge、preflight、driver invocation 整合成一个明确 smoke command builder。</td>
+          <td>减少手工拼命令时出错，提高 smoke 可重复性。</td>
+        </tr>
+        <tr>
+          <td><span class="badge partial">P2</span></td>
+          <td>Stop Hook 无法完全复刻。</td>
+          <td>继续把它标成非目标；若 OpenCode 后续有阻塞式 stop/session lifecycle hook，再替换 idle gate。</td>
+          <td>避免为了追求 100% 复刻而过度设计。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>七、最终判断</h2>
+    <p>
+      如果把 Humanize/RLCR 的核心定义为
+      <code>plan -> tracker -> reviewer-gated rounds -> continuation -> review/finalize -> durable artifacts</code>，
+      当前 OpenCode PACT 已经基本对齐。
+    </p>
+    <p>
+      如果把 Humanize/RLCR 的完整产品形态定义为
+      <code>强 plan schema + Round 0 投影 + Stop Hook 硬门禁 + raw trajectory + usage accounting + evidence/history repo</code>，
+      当前 OpenCode PACT 还只是一个实用化的 v1 复刻：主控制流跑通了，可观测文件链也足够做 LoLBench artifact coverage 和 replay 起步，
+      但还缺 Humanize 那种“每轮全量审计包”的厚度。
+    </p>
+    <div class="note">
+      <b>建议验收口径：</b>
+      当前版本可以称为 <b>Humanize-inspired PACT v1</b>，不宜称为完整 Humanize clone。
+      下一步最有价值的不是继续加 phase，而是补齐 finalize smoke、full alignment smoke、trajectory/usage/evidence 三类审计物。
+    </div>
+  </section>
+</main>
+</body>
+</html>

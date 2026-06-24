@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenCode PACT 可观测文件与 Replay 指南</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fa;
+      --panel: #ffffff;
+      --ink: #17202a;
+      --muted: #5e6b78;
+      --line: #d8dee6;
+      --accent: #0b6bcb;
+      --accent-soft: #e8f2ff;
+      --ok: #0f7b3f;
+      --warn: #9a5b00;
+      --code: #f1f4f8;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.58;
+    }
+
+    main {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 32px 24px 56px;
+    }
+
+    h1, h2, h3 {
+      line-height: 1.25;
+      margin: 0;
+    }
+
+    h1 {
+      font-size: 30px;
+      margin-bottom: 8px;
+    }
+
+    h2 {
+      font-size: 22px;
+      margin-top: 36px;
+      margin-bottom: 12px;
+      padding-top: 4px;
+    }
+
+    h3 {
+      font-size: 17px;
+      margin-top: 22px;
+      margin-bottom: 8px;
+    }
+
+    p {
+      margin: 8px 0;
+    }
+
+    code {
+      background: var(--code);
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      padding: 1px 5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    pre {
+      overflow-x: auto;
+      background: #101820;
+      color: #e8edf2;
+      border-radius: 8px;
+      padding: 14px 16px;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 18px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+    }
+
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: #eef2f6;
+      font-weight: 650;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    ul, ol {
+      padding-left: 22px;
+    }
+
+    li {
+      margin: 6px 0;
+    }
+
+    .meta {
+      color: var(--muted);
+      font-size: 14px;
+      margin-bottom: 20px;
+    }
+
+    .callout {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin: 14px 0;
+    }
+
+    .callout.warning {
+      border-left-color: var(--warn);
+      background: #fff8e8;
+    }
+
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+
+    .ok {
+      color: var(--ok);
+      font-weight: 650;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 14px;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px 16px;
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>OpenCode PACT 可观测文件与 Replay 指南</h1>
+  <p class="meta">生成日期：2026-06-24。示例 case：<code>CPython_PEP-680_tomllib-Support-for-Parsing-TOML-in-the-Standard-Library_PR-31498</code>。</p>
+
+  <div class="callout">
+    <p><strong>核心结论：</strong>人工审计时应把 <code>pact-artifacts/loops/&lt;loop-id&gt;/</code> 顶层目录视为唯一权威归档。<code>.round-history/artifacts</code> 当前只是调试用镜像，可能滞后于 finalize/complete 阶段，后续应默认关闭。</p>
+  </div>
+
+  <h2>一、目录角色</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>位置</th>
+        <th>角色</th>
+        <th>人工检查建议</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>pact-artifacts/loops/&lt;loop-id&gt;/</code></td>
+        <td>PACT loop 的主归档目录，保存 plan、round prompt、patch、review、trajectory、snapshot、result、replay case。</td>
+        <td><span class="pill">权威入口</span> 从这里看所有文件。</td>
+      </tr>
+      <tr>
+        <td><code>.round-history/artifacts</code></td>
+        <td>内部 git repo 里的 artifact 镜像，用于观察部分 artifact 随 round 演化。</td>
+        <td>当前不应作为权威来源；它可能缺少 finalize/complete/后续 round 文件。</td>
+      </tr>
+      <tr>
+        <td>case 根目录的 <code>solution.patch</code></td>
+        <td>LoLBench 最终提交给 evaluator 的实现 patch。</td>
+        <td>用于 benchmark 结果判断；可和 <code>round-XX-eval.patch</code> 做语义对比。</td>
+      </tr>
+      <tr>
+        <td><code>eval_orig/</code></td>
+        <td>LoLBench evaluator 输出，例如 <code>run.log</code>、<code>agent_report.json</code>。</td>
+        <td>用于判断最终 build/test 是否通过，不属于 PACT loop 内部决策链。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>二、文件清单与用途</h2>
+
+  <h3>Loop 级文件</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>文件</th>
+        <th>用途</th>
+        <th>Replay 作用</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>loop-manifest.json</code></td>
+        <td>记录 loop id、project root、base commit、max rounds、planner/reviewer/worker backend 和 model。</td>
+        <td>确定 replay 的 base commit 和模型配置。</td>
+      </tr>
+      <tr>
+        <td><code>state.json</code></td>
+        <td>当前 loop 的 latest 状态，例如 <code>running</code>、<code>complete</code>、当前 round、phase。</td>
+        <td>只作为 latest pointer；round 级 replay 应优先看 <code>round-XX-state.json</code>。</td>
+      </tr>
+      <tr>
+        <td><code>source-plan.md</code></td>
+        <td>原始 LoLBench prompt 或用户输入需求。</td>
+        <td>追溯 canonical plan 的来源。</td>
+      </tr>
+      <tr>
+        <td><code>plan.md</code></td>
+        <td>Round00 生成的 canonical plan，包含 goal、AC、tests、path boundaries、dependencies、task breakdown。</td>
+        <td>worker/reviewer 的权威目标输入。</td>
+      </tr>
+      <tr>
+        <td><code>todo.md</code></td>
+        <td>从 plan task breakdown 派生的执行任务表。</td>
+        <td>replay 时重建当轮 task context。</td>
+      </tr>
+      <tr>
+        <td><code>goal-tracker.md</code></td>
+        <td>Humanize-style goal tracker，含 immutable goal/AC 和 mutable progress ledger。</td>
+        <td>判断 worker 是否偏离 AC，以及 reviewer 是否批准 ledger 更新。</td>
+      </tr>
+      <tr>
+        <td><code>replay-case.json</code></td>
+        <td>latest replay case 拷贝。</td>
+        <td>只是便利入口；建议按 round 使用 <code>round-XX-replay-case.json</code>。</td>
+      </tr>
+      <tr>
+        <td><code>complete-state.md</code>、<code>finalize-summary.md</code></td>
+        <td>finalize/complete 阶段的最终说明和校验摘要。</td>
+        <td>解释为什么 loop 结束，以及最终交付物做了哪些整理。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Round00 文件</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>文件</th>
+        <th>用途</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>round-00-plan-prompt.md</code></td>
+        <td>发给 planner 的 prompt。</td>
+      </tr>
+      <tr>
+        <td><code>round-00-plan-output.md</code></td>
+        <td>planner 原始输出。</td>
+      </tr>
+      <tr>
+        <td><code>round-00-state.json</code>、<code>round-00-result.json</code></td>
+        <td>初始化阶段状态和结果。Round00 不消耗 implementation round 次数。</td>
+      </tr>
+      <tr>
+        <td><code>round-00-git-snapshot.json</code></td>
+        <td>base commit 和初始 clean/dirty 状态。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>每个 implementation round 的文件</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>文件</th>
+        <th>记录内容</th>
+        <th>主要用途</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>round-XX-prompt.md</code></td>
+        <td>本轮 worker 的完整自包含 prompt。</td>
+        <td>重跑 worker 的直接输入。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-context.json</code></td>
+        <td>本轮输入指针和 hash：plan、todo、goal tracker、feedback、worker/reviewer/planner model。</td>
+        <td>校验 replay 输入是否一致。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-state.json</code></td>
+        <td>本轮状态、phase、session id lineage。</td>
+        <td>审计 round 生命周期。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-pre-snapshot.json</code></td>
+        <td>worker 开始前的 git HEAD、status、changed/untracked files、cumulative patch metadata。</td>
+        <td>定义本轮 replay 起点。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-post-snapshot.json</code></td>
+        <td>worker 结束后捕获 patch/review 前后的 git 状态。</td>
+        <td>定义本轮输出状态；常与下一轮 pre snapshot 相同。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-events.jsonl</code></td>
+        <td>结构化事件流：round_started、tool_before/after、patch_captured、review_started/finished、round_finished。</td>
+        <td>做 timeline、失败定位、event-level replay。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-trajectory.json</code></td>
+        <td>脱敏后的 trajectory bundle，包含可获得的 driver/stdout/stderr/events 摘要。</td>
+        <td>复盘 worker 过程，比 events 更适合重建执行叙事。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-summary.md</code></td>
+        <td>worker 自述本轮做了什么、是否需要 goal tracker 更新。</td>
+        <td>reviewer 的核心输入之一。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-workspace.patch</code></td>
+        <td>workspace 累计 patch，保留测试文件等可观测变更，但排除 PACT 自身文件和 benchmark scaffold。</td>
+        <td>分析 worker 全部改动，包括测试草稿。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-eval.patch</code></td>
+        <td>用于 benchmark/eval 的累计实现 patch，排除 <code>.pact/**</code>、root patch 文件、以及 <code>test.patch</code> 声明的测试路径。</td>
+        <td>最终可提交 patch 的 PACT 版本。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-patch-artifact.json</code></td>
+        <td>workspace/eval patch 的 sha、bytes、lines、changed files、excluded scaffolding metadata、apply check。</td>
+        <td>机器检查 patch 是否为空、是否污染、是否可应用。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-review-prompt.md</code></td>
+        <td>发给 reviewer 的 prompt。</td>
+        <td>复盘 reviewer 判断依据。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-review.md</code></td>
+        <td>reviewer 原始 markdown 输出，要求包含固定结构和末尾 marker。</td>
+        <td>人工判断 reviewer 是否过严/过松。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-review-decision.json</code></td>
+        <td>解析后的 reviewer marker、parse status、backend/model、terminal line、feedback path。</td>
+        <td>程序化判断继续、进入 finalize、失败或停止。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-feedback.md</code></td>
+        <td>给下一轮 worker 的精简反馈。</td>
+        <td>下一轮 continuation prompt 的关键输入。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-result.json</code></td>
+        <td>本轮状态、failure category、metrics、artifact path map。</td>
+        <td>汇总本轮 outcome，适合批量统计。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-evidence.json</code></td>
+        <td>机器可读 evidence manifest，列出关键文件是否存在和 sha256。</td>
+        <td>完整性校验、批处理索引。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-evidence.md</code></td>
+        <td>同一 evidence 的人工可读表格。</td>
+        <td>人工审计时快速扫文件链。</td>
+      </tr>
+      <tr>
+        <td><code>round-XX-replay-case.json</code></td>
+        <td>本轮 replay package，包含输入文本、artifact map、snapshot、trajectory、review、baseline result。</td>
+        <td>round 级 replay 的主入口。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>三、Replay 怎么做</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>结果级 replay</h3>
+      <p>目标是验证归档 patch 能否在 base commit 上复现最终文件状态。</p>
+      <ol>
+        <li>从 <code>loop-manifest.json</code> 读取 <code>base_commit</code>。</li>
+        <li>准备同一仓库的干净 checkout，并切到 base commit。</li>
+        <li>应用 <code>round-XX-eval.patch</code> 或最终 <code>solution.patch</code>。</li>
+        <li>重新捕获规范化 patch，并比较 changed files、文件内容 hash、recaptured patch hash。</li>
+      </ol>
+    </div>
+    <div class="card">
+      <h3>Round 级 replay</h3>
+      <p>目标是复现某一轮 worker 输入到输出的过程。</p>
+      <ol>
+        <li>选择 <code>round-XX-replay-case.json</code>。</li>
+        <li>用 base commit 加上一轮累计 eval patch 还原本轮 pre state。</li>
+        <li>用 <code>round-XX-prompt.md</code>、<code>round-XX-context.json</code>、feedback 和 plan/todo/goal tracker 作为 worker 输入。</li>
+        <li>worker 执行后捕获 patch，并和 <code>round-XX-eval.patch</code> 或 expected delta 做语义对比。</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="callout warning">
+    <p><strong>当前限制：</strong>代码里已有 replay case export，但还没有独立 replay runner。现在能稳定做的是 patch-level replay；真正“重新调用 worker 并比较输出”的 runner 仍需要后续实现。</p>
+  </div>
+
+  <h2>四、本次 Replay Smoke 结果</h2>
+  <p>Smoke 对象：</p>
+  <pre>/Users/gujiazhen/Documents/cc_codes/outputs/opencode_pact_lolbench_formal20_20260623T182351Z/opencode-pact-zai-coding-plan-formal20/CPython_PEP-680_tomllib-Support-for-Parsing-TOML-in-the-Standard-Library_PR-31498</pre>
+
+  <table>
+    <thead>
+      <tr>
+        <th>检查项</th>
+        <th>结果</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Base commit</td>
+        <td><code>39ef9d60bcf67c6f8aca795f5d9139a64435c2d7</code></td>
+      </tr>
+      <tr>
+        <td><code>round-02-eval.patch</code> apply check</td>
+        <td><span class="ok">passed</span></td>
+      </tr>
+      <tr>
+        <td>最终 <code>solution.patch</code> apply check</td>
+        <td><span class="ok">passed</span></td>
+      </tr>
+      <tr>
+        <td>原始 patch sha 是否一致</td>
+        <td>不一致。原因是 patch 文件块顺序不同，不是文件内容不同。</td>
+      </tr>
+      <tr>
+        <td>应用后的 changed file list</td>
+        <td><span class="ok">一致</span>，共 6 个文件。</td>
+      </tr>
+      <tr>
+        <td>应用后的 changed file content</td>
+        <td><span class="ok">一致</span></td>
+      </tr>
+      <tr>
+        <td>重新捕获后的规范化 patch</td>
+        <td><span class="ok">一致</span>，sha 为 <code>b1c8c34310aadd5732e100d40e01ccce2b57ad865480041e92aedf3c2cb221ef</code>。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>复现出的 6 个实现文件：</p>
+  <pre>Doc/library/fileformats.rst
+Doc/library/tomllib.rst
+Lib/tomllib/__init__.py
+Lib/tomllib/_parser.py
+Makefile.pre.in
+Misc/NEWS.d/next/Library/tomllib.bpo-40060.rst</pre>
+
+  <h2>五、人工审计建议</h2>
+  <ol>
+    <li>先看 <code>loop-manifest.json</code>、<code>state.json</code>、<code>finalize-summary.md</code>，确认 loop 的最终状态和模型配置。</li>
+    <li>再按 round 查看 <code>round-XX-prompt.md</code>、<code>round-XX-summary.md</code>、<code>round-XX-review.md</code>、<code>round-XX-feedback.md</code>。</li>
+    <li>如果怀疑 patch 污染，看 <code>round-XX-patch-artifact.json</code> 的 <code>excluded_scaffolding_files</code> 和 <code>excluded_test_patch_files</code>。</li>
+    <li>如果怀疑上下文漂移，看 <code>round-XX-context.json</code> 和 pre/post snapshot 的 hash。</li>
+    <li>如果怀疑 worker 做了不该做的操作，看 <code>round-XX-events.jsonl</code> 和 <code>round-XX-trajectory.json</code>。</li>
+    <li>如果要做结果复现，用 <code>round-XX-eval.patch</code> 在 base commit 上应用并重新捕获 patch。</li>
+  </ol>
+
+  <h2>六、后续设计记录</h2>
+  <p>已在 implementation plan 里记录新的 follow-up：默认关闭 <code>.round-history</code>，把顶层 loop 目录作为唯一权威归档。为了保留历史语义，后续应补充必要的 round-scoped ledger snapshot，例如 <code>round-XX-goal-tracker-pre.md</code> 和 <code>round-XX-goal-tracker-post.md</code>。</p>
+
+  <div class="callout">
+    <p><strong>一句话版本：</strong>PACT replay 的权威链路应该是 <code>base commit + round package + patch/evidence/result</code>，而不是依赖临时 worktree 路径或内部镜像目录。</p>
+  </div>
+</main>
+</body>
+</html>
