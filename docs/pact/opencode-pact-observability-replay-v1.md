@@ -8,6 +8,8 @@ Today the plugin can start a PACT loop, keep a todo and goal tracker, run a work
 
 For CLI and LoLBench, the default round boundary is driver-owned `opencode run` exit: one worker process equals one round. When the worker process exits, the driver synchronously captures patch/snapshot/trajectory artifacts, invokes the reviewer, writes the result/replay bundle, and emits the next round prompt. The OpenCode `session.idle` path remains as an interactive fallback.
 
+For retries after planner or outer timeout cost has already been paid, the driver supports explicit Round00 resume. `--resume-loop <loopDir>` / `PACT_RESUME_LOOP_DIR` with `round0` mode validates an existing Round00 package, creates a fresh loop in the target workspace, copies canonical plan/todo/goal-tracker artifacts, records the resume source, regenerates `round-01-prompt.md`, and starts directly at round1. This keeps the benchmark workspace clean while avoiding a second planner call.
+
 In benchmark strict mode, worker prompts and tool reads are separated from reviewer-only evidence. The worker can read canonical plan/ledger files, its prompt, contract, summary, continuation package, and pre-snapshot. Raw feedback, verification logs, replay bundles, event logs, evidence, review outputs, and captured patches remain available for the driver, reviewer, reports, and humans, but are not fed back into worker rounds by default.
 
 LoLBench defaults now use a public-loop/final-hidden split. Each worker round may run only worker-safe round verification: patch apply plus an optional public build/self-check command. It must not run LoLBench hidden `pact-gate`, must not apply `eval_tests.patch`, and must not expose F2P/P2P to the worker. Only after the reviewer writes candidate `PACT_COMPLETE` does the driver run the LoLBench hidden final gate for scoring/reporting artifacts. Hidden final failure stops the loop as unresolved; it is not reopened into worker feedback in v1.
@@ -37,6 +39,7 @@ v1 adds a small artifact chain under `.pact/loops/<loopID>/` so every round can 
 | Stage                 | Input                                                                                                                       | Files Written                                                                                              | Later Use                                                                                    |
 | --------------------- | --------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | Loop Start            | Plan file, project root, worker session, max rounds, full alignment interval, planner backend/model, reviewer backend/model, worker backend/model/config source | `state.json`, `loop-manifest.json`, `plan.md`, `todo.md`, `goal-tracker.md`, workspace `.git/info/exclude` | Establish run identity, goal, plan anchor, active session, worker attribution, and loop phase. |
+| Round00 Resume        | Existing loop directory with complete Round00 package, fresh project root, max rounds, current worker/reviewer config       | `state.json`, `loop-manifest.json`, `resume-source-loop-manifest.json`, copied Round00 files, regenerated `round-01-prompt.md`, workspace `.git/info/exclude` | Restart from canonical planning without re-running planner or reusing partial worker output.  |
 | Round Start           | Current state, todo, goal tracker, previous feedback                                                                        | `round-XX-state.json`, `round-XX-context.json`                                                             | Explain the checkpoint input and provide replay context.                                     |
 | Worker Execution      | Worker prompt, repository state, summarized tool events                                                                     | `round-XX-events.jsonl`, `round-XX-contract.md`, `round-XX-summary.md`                                      | Show key actions, worker-declared scope, and detect missing summary or worker failure.        |
 | Patch Capture         | Repository diff at round end                                                                                                | `round-XX-workspace.patch`, `round-XX-eval.patch`, `round-XX-test.patch`, `round-XX-patch-artifact.json`    | Determine empty patch, changed files, patch hash, and replay or eval candidate.              |
@@ -83,6 +86,21 @@ Minimum fields:
 - `artifact_version`: `1`
 
 Purpose: make a loop indexable without reading every markdown file.
+
+### `resume-source-loop-manifest.json`
+
+Present only for Round00 resume loops.
+
+Minimum fields: exact copy of the source loop's `loop-manifest.json`.
+
+The new loop's own `loop-manifest.json` records:
+
+- `resume_mode`: `"round0"`
+- `resume_source_loop`
+- `resume_source_loop_id`
+- `round0_reused`: `true`
+
+Purpose: preserve provenance when a fresh workspace reuses an existing canonical Round00 package and restarts from round1.
 
 ### `round-XX-state.json`
 
@@ -333,6 +351,8 @@ v1 failure categories:
 - `max_rounds`
 - `cancelled`
 - `unknown`
+
+When a terminal round stops the loop, the driver mirrors the final `failure_category` into `state.json.stop_reason` unless a more specific stop reason, such as `final_hidden_gate_failed`, was already set.
 
 Minimum metrics:
 

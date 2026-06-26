@@ -28,6 +28,24 @@ function tempGitProject(): string {
   return dir
 }
 
+function tempGitWorktreeProject(): string {
+  const base = tempGitProject()
+  const parent = mkdtempSync(join(tmpdir(), "pact-driver-worktree-parent-"))
+  tempDirs.push(parent)
+  const dir = join(parent, "worktree")
+  const branch = `pact-test-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  execFileSync("git", ["worktree", "add", "-q", "-b", branch, dir], { cwd: base })
+  return dir
+}
+
+function gitInfoExcludeText(projectRoot: string): string {
+  const excludePath = execFileSync("git", ["rev-parse", "--git-path", "info/exclude"], {
+    cwd: projectRoot,
+    encoding: "utf-8",
+  }).trim()
+  return readFileSync(excludePath, "utf-8")
+}
+
 function validPlannerOutput(): string {
   return `<<<PACT_PLAN>>>
 # Goal Description
@@ -135,6 +153,34 @@ describe("PACT run driver", () => {
       else process.env.LOLBENCH_REPO_ROOT = oldRepoRoot
       if (oldCommand === undefined) delete process.env.PACT_VERIFICATION_COMMAND
       else process.env.PACT_VERIFICATION_COMMAND = oldCommand
+    }
+  })
+
+  test("parses round0 resume loop from CLI or environment", () => {
+    const oldResume = process.env.PACT_RESUME_LOOP_DIR
+    const oldMode = process.env.PACT_RESUME_MODE
+    process.env.PACT_RESUME_LOOP_DIR = "/tmp/archive/loops/L"
+    process.env.PACT_RESUME_MODE = "round0"
+    try {
+      const fromEnv = cliArgs(["--plan-file", "/tmp/PROMPT.md"])
+      expect(fromEnv.resumeLoopDir).toBe("/tmp/archive/loops/L")
+      expect(fromEnv.resumeMode).toBe("round0")
+
+      const fromCli = cliArgs([
+        "--plan-file",
+        "/tmp/PROMPT.md",
+        "--resume-loop",
+        "/tmp/other/loops/M",
+        "--resume-mode",
+        "round0",
+      ])
+      expect(fromCli.resumeLoopDir).toBe("/tmp/other/loops/M")
+      expect(fromCli.resumeMode).toBe("round0")
+    } finally {
+      if (oldResume === undefined) delete process.env.PACT_RESUME_LOOP_DIR
+      else process.env.PACT_RESUME_LOOP_DIR = oldResume
+      if (oldMode === undefined) delete process.env.PACT_RESUME_MODE
+      else process.env.PACT_RESUME_MODE = oldMode
     }
   })
 
@@ -247,6 +293,78 @@ Continue source changes.
     expect(existsSync(join(result.loopDir!, "round-00-plan-output.md"))).toBe(true)
     expect(existsSync(join(result.loopDir!, "round-01-prompt.md"))).toBe(true)
     expect(readState(result.loopDir!).worker_round_count).toBe(1)
+  })
+
+  test("resumes from an existing Round00 package without invoking planner", () => {
+    const sourceProject = tempGitProject()
+    const project = tempGitWorktreeProject()
+    const sourceLoop = createLoop({
+      projectRoot: sourceProject,
+      planFile: join(sourceProject, "plan.md"),
+      maxRounds: 3,
+      plannerBackend: "codex-cli",
+      plannerModel: "gpt-5.5",
+      reviewerBackend: "codex-cli",
+      reviewerModel: "gpt-5.4-mini",
+      workerBackend: "opencode-cli",
+      workerModel: "zai-coding-plan/glm-5-turbo",
+      sessionStrategy: "new-per-round",
+      roundBoundary: "run_exit",
+      trajectoryMode: "full-redact",
+    })
+    writeFileSync(join(sourceLoop.loopDir, "plan.md"), "# Goal Description\nResume canonical plan.\n", "utf-8")
+    writeFileSync(join(sourceLoop.loopDir, "todo.md"), "# Todo\n| Task ID | Description |\n", "utf-8")
+    writeFileSync(
+      join(sourceLoop.loopDir, "goal-tracker.md"),
+      "# Goal Tracker\n## IMMUTABLE SECTION\n### Ultimate Goal\nResume.\n### Acceptance Criteria\nAC-1\n## MUTABLE SECTION\n",
+      "utf-8",
+    )
+    writeFileSync(join(sourceLoop.loopDir, "round-01-prompt.md"), "stale old prompt\n", "utf-8")
+
+    const calls: Array<{ input: string }> = []
+    const result = runPactDriver({
+      projectRoot: project,
+      planFile: join(project, "plan.md"),
+      model: "zai-coding-plan/glm-5-turbo",
+      maxRounds: 1,
+      opencodeCommand: "fake-opencode",
+      maxInvocations: 1,
+      resumeLoopDir: sourceLoop.loopDir,
+      resumeMode: "round0",
+      planner() {
+        throw new Error("planner should not be called for round0 resume")
+      },
+      reviewer() {
+        return "### Decision Summary\nContinue.\n"
+      },
+      spawnSync(_command, _args, options) {
+        calls.push({ input: options.input })
+        appendFileSync(join(project, "src.txt"), "worker change after resume\n", "utf-8")
+        return { status: 0, stdout: "worker run\n", stderr: "" }
+      },
+    })
+
+    expect(result.status).toBe("stopped")
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.input).toContain("# PACT Round 01")
+    expect(calls[0]?.input).not.toContain("stale old prompt")
+    expect(result.loopDir).toBeDefined()
+    expect(result.loopDir).not.toBe(sourceLoop.loopDir)
+    expect(existsSync(join(result.loopDir!, "round-00-result.json"))).toBe(true)
+    expect(existsSync(join(result.loopDir!, "round-01-prompt.md"))).toBe(true)
+    expect(readFileSync(join(result.loopDir!, "plan.md"), "utf-8")).toContain("Resume canonical plan")
+    expect(calls[0]?.input).toContain(join(result.loopDir!, "plan.md"))
+    const excludeText = gitInfoExcludeText(project)
+    expect(excludeText).toContain(".pact/")
+    expect(excludeText).toContain("/*.patch")
+    expect(excludeText).toContain("/*.diff")
+    const state = readState(result.loopDir!)
+    expect(state.next_round).toBe(2)
+    expect(state.attempted_worker_rounds).toBe(1)
+    expect(state.completed_worker_rounds).toBe(1)
+    const manifest = readFileSync(join(result.loopDir!, "loop-manifest.json"), "utf-8")
+    expect(manifest).toContain('"resume_mode": "round0"')
+    expect(manifest).toContain(sourceLoop.loopID)
   })
 
   test("docker worker runner wraps each OpenCode round in a container", () => {
@@ -364,6 +482,11 @@ Continue.
       expect(calls).toHaveLength(1)
       expect(calls[0]?.input).toContain("# PACT Round 01")
       expect(readFileSync(join(result.loopDir!, "round-00-plan-output.md"), "utf-8")).toContain("<<<PACT_PLAN>>>")
+      const state = readState(result.loopDir!)
+      expect(state.stop_reason).toBe("max_rounds")
+      expect(readFileSync(join(result.loopDir!, "round-01-result.json"), "utf-8")).toContain(
+        '"failure_category": "max_rounds"',
+      )
     } finally {
       if (oldPath === undefined) delete process.env.PATH
       else process.env.PATH = oldPath
