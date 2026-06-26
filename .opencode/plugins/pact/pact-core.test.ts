@@ -13,6 +13,7 @@ import {
   buildContinuationPrompt,
   buildFinalizePrompt,
   buildInitialWorkerPrompt,
+  buildPlannerPrompt,
   buildPlannerRepairPrompt,
   buildReviewPrompt,
   capturePatchArtifact,
@@ -20,11 +21,14 @@ import {
   createLoop,
   exportReplayCase,
   isImmutableGoalTrackerEdit,
+  isProtectedWrite,
   normalizePlanLedger,
   parsePlannerArtifacts,
   parseReviewDecision,
   readState,
   recordReviewDecision,
+  writeContinuationPackage,
+  writeVerificationArtifact,
   extractPatchChangedPaths,
   sha256Text,
   summarizeToolArgs,
@@ -80,6 +84,10 @@ describe("artifact helpers", () => {
       workspacePatch: "/tmp/loop/round-01-workspace.patch",
       evalPatch: "/tmp/loop/round-01-eval.patch",
       patchArtifact: "/tmp/loop/round-01-patch-artifact.json",
+      verification: "/tmp/loop/round-01-verification.json",
+      verificationLog: "/tmp/loop/round-01-verification.log",
+      continuationPackage: "/tmp/loop/round-01-continuation-package.md",
+      continuationPackageJson: "/tmp/loop/round-01-continuation-package.json",
       reviewDecision: "/tmp/loop/round-01-review-decision.json",
       roundResult: "/tmp/loop/round-01-result.json",
       roundReplayCase: "/tmp/loop/round-01-replay-case.json",
@@ -105,6 +113,77 @@ describe("artifact helpers", () => {
     expect(readFileSync(jsonPath, "utf-8")).toBe('{\n  "z": 1,\n  "a": true\n}\n')
     expect(readFileSync(jsonlPath, "utf-8")).toBe('{"event":"first"}\n{"event":"second"}\n')
   })
+
+  test("writes verification and continuation package artifacts", () => {
+    const project = tempGitProject()
+    const loop = createLoop({
+      projectRoot: project,
+      planFile: join(project, "plan.md"),
+      maxRounds: 3,
+    })
+    const paths = artifactPaths(loop.loopDir, 1)
+    writeFileSync(paths.evalPatch, "diff --git a/src.txt b/src.txt\n", "utf-8")
+    const verification = writeVerificationArtifact({
+      loopDir: loop.loopDir,
+      round: 1,
+      command: "fake grade",
+      status: "failed",
+      exitCode: 1,
+      durationMs: 1200,
+      patchSha256: "abc123",
+      applied: false,
+      resolved: false,
+      buildStatus: "failed",
+      f2p: { passed: 0, total: 3 },
+      p2p: { passed: 0, total: 3 },
+      errorCategories: ["build_failure"],
+      logText:
+        "compiler said secret-token=abc should be hidden\n[run_tests eval/orig] eval_tests.patch did not apply\nF2P 0/3 P2P 0/3\nDocker grade log: hidden eval TestRecord.java:152: error\n",
+      source: "lightweight",
+    })
+    const pkg = writeContinuationPackage({
+      loopDir: loop.loopDir,
+      round: 1,
+      nextRound: 2,
+      maxRounds: 3,
+      workerRoundCount: 1,
+      loopPhase: "implementation",
+      reviewText:
+        "### Findings\n- Docker grade says eval_tests.patch failed and F2P 0/3.\n\n### Next Worker Instructions\nRerun lolbench_eval.py pact-gate and repair hidden eval TestRecord constructor failure.",
+      verification,
+      changedFiles: ["src.txt"],
+      patchSha256: "abc123",
+      feedbackPath: join(loop.loopDir, "round-01-feedback.md"),
+    })
+
+    expect(readFileSync(paths.verificationLog, "utf-8")).toContain("TestRecord.java:152")
+    expect(readFileSync(paths.verificationLog, "utf-8")).not.toContain("secret-token=abc")
+    expect(JSON.parse(readFileSync(paths.verification, "utf-8"))).toMatchObject({
+      schema: "pact-round-verification/v1",
+      round: 1,
+      status: "failed",
+      applied: false,
+      resolved: false,
+      build_status: "failed",
+      f2p: { passed: 0, total: 3 },
+      error_categories: ["build_failure"],
+    })
+    expect(pkg.markdown).toContain("Remaining worker rounds: 2")
+    expect(pkg.markdown).not.toContain("Latest Verification Log Tail")
+    expect(pkg.markdown).not.toContain("TestRecord.java:152")
+    expect(pkg.markdown).not.toContain("eval_tests.patch")
+    expect(pkg.markdown).not.toContain("F2P")
+    expect(pkg.markdown).not.toContain("P2P")
+    expect(pkg.markdown).not.toContain("hidden eval")
+    expect(pkg.markdown).not.toContain("lolbench_eval.py")
+    expect(pkg.markdown).toContain("Use the worker-safe continuation package and changed files to make workspace-only source changes")
+    expect(JSON.parse(readFileSync(paths.continuationPackageJson, "utf-8"))).toMatchObject({
+      schema: "pact-continuation-package/v1",
+      round: 1,
+      next_round: 2,
+      verification: { status: "failed", build_status: "failed" },
+    })
+  })
 })
 
 describe("loop and round artifacts", () => {
@@ -129,6 +208,38 @@ Ship the checkpoint loop.
     expect(artifacts.goalTracker).toContain("| AC-1 | Reviewer complete should enter review phase.")
     expect(artifacts.goalTracker).toContain("## MUTABLE SECTION")
     expect(artifacts.goalTracker).toContain("#### Active Tasks")
+  })
+
+  test("normalizes LoLBench patch files as harness-owned artifacts, not worker tasks", () => {
+    const artifacts = normalizePlanLedger({
+      planPath: "PROMPT.md",
+      planContent: `# Task
+Implement PEP 680 tomllib support, delivering implementation changes only in solution.patch and tests in test.patch.
+
+- AC-1: Add tomllib.
+- AC-2: Implementation changes are isolated to solution.patch; tests, if added, are isolated to test.patch.
+
+- [ ] Add tomllib implementation
+- [ ] Generate and inspect solution.patch and optional test.patch for boundary compliance
+`,
+    })
+
+    expect(artifacts.todo).toContain("Add tomllib implementation")
+    expect(artifacts.todo).toContain("Keep implementation and optional test changes separable")
+    expect(artifacts.todo).not.toContain("Generate and inspect solution.patch")
+    expect(artifacts.goalTracker).toContain("PACT/harness")
+    expect(artifacts.goalTracker).not.toContain("solution.patch")
+    expect(artifacts.goalTracker).not.toContain("test.patch")
+  })
+
+  test("planner prompt explains that benchmark patch files are not worker outputs", () => {
+    const prompt = buildPlannerPrompt({
+      planPath: "PROMPT.md",
+      planContent: "Deliver implementation in solution.patch and tests in test.patch.",
+    })
+
+    expect(prompt).toContain("PACT/harness owns final patch export")
+    expect(prompt).toContain("Do not create acceptance criteria or tasks that ask the worker to generate, edit, stage, or inspect")
   })
 
   test("createLoop writes a loop manifest", () => {
@@ -158,7 +269,7 @@ Ship the checkpoint loop.
       session_strategy: "new-per-round",
       trajectory_mode: "full-redact",
       phase_config: {
-        gate: "session.idle",
+        gate: "session_idle",
         stop_hook: false,
       },
       planner_backend: "codex-cli",
@@ -641,6 +752,61 @@ describe("worker prompt shape", () => {
     }
   })
 
+  test("worker prompts reserve patch export, git index, and external validation gates for PACT", () => {
+    const project = tempProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
+
+    const initial = buildInitialWorkerPrompt({
+      loopDir: loop.loopDir,
+      round: 1,
+      todoPath: join(loop.loopDir, "todo.md"),
+      goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+    })
+    const continuation = buildContinuationPrompt({
+      loopDir: loop.loopDir,
+      round: 2,
+      feedbackPath: join(loop.loopDir, "round-01-feedback.md"),
+      goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+    })
+
+    for (const prompt of [initial, continuation]) {
+      expect(prompt).toContain("Do not create or edit external validation-owned patch files")
+      expect(prompt).toContain("Do not run external validation gates")
+      expect(prompt).not.toContain("lolbench_eval.py")
+      expect(prompt).toContain("Do not stage, reset, commit, stash, or otherwise manage git index state")
+    }
+  })
+
+  test("worker prompts require a round contract but treat ledgers as reviewer-owned", () => {
+    const project = tempProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
+
+    const initial = buildInitialWorkerPrompt({
+      loopDir: loop.loopDir,
+      round: 1,
+      todoPath: join(loop.loopDir, "todo.md"),
+      goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+    })
+    const continuation = buildContinuationPrompt({
+      loopDir: loop.loopDir,
+      round: 2,
+      feedbackPath: join(loop.loopDir, "round-01-feedback.md"),
+      goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+    })
+
+    for (const prompt of [initial, continuation]) {
+      expect(prompt).toContain("round-")
+      expect(prompt).toContain("-contract.md")
+      expect(prompt).toContain("single mainline objective")
+      expect(prompt).toContain("blocking")
+      expect(prompt).toContain("queued")
+      expect(prompt).toContain("Do not directly edit todo.md")
+      expect(prompt).toContain("Ledger Update Request")
+      expect(prompt).not.toContain("goes idle")
+    }
+    expect(initial).toContain("when this bounded run ends")
+  })
+
   test("continuation prompts are self-contained round packages", () => {
     const project = tempProject()
     const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
@@ -658,14 +824,257 @@ describe("worker prompt shape", () => {
     expect(prompt).toContain("Plan:")
     expect(prompt).toContain("Todo:")
     expect(prompt).toContain("Goal tracker:")
-    expect(prompt).toContain("Reviewer feedback:")
+    expect(prompt).not.toContain("Reviewer feedback:")
     expect(prompt).toContain("Pre-round snapshot:")
-    expect(prompt).toContain("Cumulative eval patch:")
+    expect(prompt).not.toContain("Cumulative eval patch:")
+    expect(prompt).not.toContain("round-01-feedback.md")
+    expect(prompt).not.toContain("round-01-eval.patch")
+    expect(prompt).not.toContain("LoLBench")
     expect(prompt).toContain("write an honest summary")
+  })
+
+  test("continuation package translates benchmark-owned patch and gate feedback into workspace-only work", () => {
+    const project = tempProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
+    const verification = writeVerificationArtifact({
+      loopDir: loop.loopDir,
+      round: 1,
+      command: "python3 /bench/lolbench_eval.py pact-gate",
+      status: "failed",
+      buildStatus: "skipped",
+      logText:
+        "[run_tests eval/orig] eval_tests.patch did not apply cleanly on top of source patch:\nerror: Lib/test/test_tomllib/__main__.py: already exists in working directory\n",
+    })
+
+    const { artifact, markdown } = writeContinuationPackage({
+      loopDir: loop.loopDir,
+      round: 1,
+      nextRound: 2,
+      maxRounds: 12,
+      workerRoundCount: 1,
+      loopPhase: "implementation",
+      verification,
+      changedFiles: ["Lib/test/test_tomllib/__main__.py", "Lib/tomllib/_parser.py"],
+      reviewText: `### Findings
+- round-01-patch-artifact.json shows workspace_patch and eval_patch are identical.
+
+### Next Worker Instructions
+Regenerate the patch artifacts so the eval patch contains only the incremental delta after the source patch, then rerun the pact gate until patch application succeeds and build_status is success.
+`,
+    })
+
+    expect(artifact.next_worker_instruction).not.toContain("Regenerate the patch artifacts")
+    expect(artifact.next_worker_instruction).not.toContain("rerun the pact gate")
+    expect(markdown).not.toContain("Regenerate the patch artifacts")
+    expect(markdown).not.toContain("rerun the pact gate")
+    expect(markdown).not.toContain("eval_tests.patch")
+    expect(markdown).not.toContain("benchmark eval patches")
+    expect(markdown).not.toContain("eval failure")
+    expect(markdown).not.toContain("Latest Verification Log Tail")
+    expect(JSON.stringify(artifact)).not.toContain("verification.json")
+    expect(JSON.stringify(artifact)).not.toContain("round-01-feedback.md")
+    expect(markdown).toContain("Do not modify PACT artifacts or run gates")
+    expect(markdown).toContain("make workspace-only source changes")
+    expect(markdown).toContain("Lib/test/test_tomllib/__main__.py")
+  })
+
+  test("continuation package does not expose verification artifact paths to worker", () => {
+    const project = tempProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
+    const verification = writeVerificationArtifact({
+      loopDir: loop.loopDir,
+      round: 4,
+      command: "python3 /bench/lolbench_eval.py pact-gate",
+      status: "failed",
+      buildStatus: "skipped",
+      logText:
+        "[run_tests eval/orig] eval_tests.patch did not apply cleanly on top of source patch:\nerror: Lib/test/test_unparse.py: patch does not apply\n",
+    })
+
+    const { markdown } = writeContinuationPackage({
+      loopDir: loop.loopDir,
+      round: 4,
+      nextRound: 5,
+      maxRounds: 10,
+      workerRoundCount: 4,
+      loopPhase: "implementation",
+      verification,
+      changedFiles: ["Lib/test/test_unparse.py", "Python/compile.c"],
+      reviewText: `### Findings
+- Blocking: round-04-eval.patch does not apply cleanly. See [verification](${join(
+        loop.loopDir,
+        "round-04-verification.json",
+      )}#L23) and [log](${join(loop.loopDir, "round-04-verification.log")}#L1).
+
+### Next Worker Instructions
+Fix the patch export so round-04-eval.patch applies cleanly on top of the source patch, then rerun the gate.
+`,
+    })
+    const prompt = buildContinuationPrompt({
+      loopDir: loop.loopDir,
+      round: 5,
+      feedbackPath: join(loop.loopDir, "round-04-feedback.md"),
+      goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+      continuationPackageText: markdown,
+      continuationPackagePath: join(loop.loopDir, "round-04-continuation-package.md"),
+    })
+
+    for (const workerText of [markdown, prompt]) {
+      expect(workerText).not.toContain("round-04-verification.json")
+      expect(workerText).not.toContain("round-04-verification.log")
+      expect(workerText).not.toContain("Fix the patch export")
+      expect(workerText).not.toContain("rerun the gate")
+      expect(workerText).toContain("[redacted worker-unsafe benchmark/eval detail]")
+    }
+  })
+
+  test("continuation package redacts reviewer-restated eval case details", () => {
+    const project = tempProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
+    const verification = writeVerificationArtifact({
+      loopDir: loop.loopDir,
+      round: 2,
+      command: "python3 /bench/lolbench_eval.py pact-gate",
+      status: "failed",
+      buildStatus: "ok",
+      f2p: { passed: 2, total: 6 },
+      p2p: { passed: 18, total: 18 },
+      logText:
+        "test_ast.AST_Tests.test_snippets failed\nForwardRef('*c')\na[*a,] unparses as a[(*a,)]\n",
+    })
+
+    const { markdown } = writeContinuationPackage({
+      loopDir: loop.loopDir,
+      round: 2,
+      nextRound: 3,
+      maxRounds: 10,
+      workerRoundCount: 2,
+      loopPhase: "implementation",
+      verification,
+      changedFiles: ["Grammar/python.gram", "Parser/parser.c", "Python/compile.c"],
+      patchSha256: "abc123",
+      reviewText: `### Findings
+- [Python/compile.c](/private/tmp/workspace/Python/compile.c#L2375) sends starred vararg annotations through future-annotations handling, which leads to a \`ForwardRef('*c')\` failure in verification. This blocks AC-6.
+- [Parser/parser.c](/private/tmp/workspace/Parser/parser.c#L5482) constructs the \`Starred\` annotation node with locations that do not match expected AST spans; verification shows a column-offset mismatch in \`test_ast.AST_Tests.test_snippets\`.
+- [Parser/parser.c](/private/tmp/workspace/Parser/parser.c#L13897) leaves starred subscript round-tripping inconsistent; verification reports \`a[*a,]\` unparses as \`a[(*a,)]\`, which blocks AC-7.
+
+### Next Worker Instructions
+Fix future-annotations handling for starred vararg annotations, AST span correctness, and starred-subscript unparse round-tripping.
+`,
+    })
+    const prompt = buildContinuationPrompt({
+      loopDir: loop.loopDir,
+      round: 3,
+      feedbackPath: join(loop.loopDir, "round-02-feedback.md"),
+      goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+      continuationPackageText: markdown,
+      continuationPackagePath: join(loop.loopDir, "round-02-continuation-package.md"),
+    })
+
+    for (const workerText of [markdown, prompt]) {
+      expect(workerText).not.toContain("test_ast.AST_Tests.test_snippets")
+      expect(workerText).not.toContain("ForwardRef")
+      expect(workerText).not.toContain("a[*a,]")
+      expect(workerText).not.toContain("a[(*a,)]")
+      expect(workerText).not.toContain("f2p")
+      expect(workerText).not.toContain("p2p")
+      expect(workerText).not.toContain("F2P")
+      expect(workerText).not.toContain("P2P")
+      expect(workerText).toContain("[redacted worker-unsafe benchmark/eval detail]")
+      expect(workerText).toContain("Fix future-annotations handling")
+    }
+  })
+
+  test("continuation package preserves safe action when reviewer instruction includes eval tokens", () => {
+    const project = tempProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
+    const verification = writeVerificationArtifact({
+      loopDir: loop.loopDir,
+      round: 1,
+      command: "python3 /bench/lolbench_eval.py pact-gate",
+      status: "failed",
+      buildStatus: "ok",
+      logText: "}\n",
+    })
+
+    const { artifact, markdown } = writeContinuationPackage({
+      loopDir: loop.loopDir,
+      round: 1,
+      nextRound: 2,
+      maxRounds: 3,
+      workerRoundCount: 1,
+      loopPhase: "implementation",
+      verification,
+      changedFiles: ["Grammar/python.gram", "Parser/parser.c", "Python/compile.c"],
+      reviewText: `### Findings
+- The current patch still has source-level regressions around starred annotations.
+
+### Next Worker Instructions
+Fix the starred-subscript unparse regression, the *args source-location regression, and the future-annotations ForwardRef('*c') failure, then rerun the same focused evaluation until F2P passes.
+`,
+    })
+
+    expect(artifact.latest_failure_signature).toBeUndefined()
+    expect(markdown).not.toContain("Latest failure category: }")
+    expect(artifact.next_worker_instruction).toContain("Fix the starred-subscript unparse regression")
+    expect(artifact.next_worker_instruction).toContain("source-location regression")
+    expect(artifact.next_worker_instruction).toContain("future-annotations")
+    expect(artifact.next_worker_instruction).not.toContain("ForwardRef")
+    expect(artifact.next_worker_instruction).not.toContain("F2P")
+    expect(markdown).toContain("Fix the starred-subscript unparse regression")
+    expect(markdown).not.toContain("ForwardRef")
+    expect(markdown).not.toContain("F2P")
+  })
+
+  test("worker prompts make contract-first and stop-after-summary explicit", () => {
+    const loopDir = "/tmp/project/.pact/loops/2026-06-26T00-00-00Z"
+    const initial = buildInitialWorkerPrompt({
+      loopDir,
+      round: 1,
+      todoPath: join(loopDir, "todo.md"),
+      goalTrackerPath: join(loopDir, "goal-tracker.md"),
+    })
+    const continuation = buildContinuationPrompt({
+      loopDir,
+      round: 2,
+      feedbackPath: join(loopDir, "round-01-feedback.md"),
+      goalTrackerPath: join(loopDir, "goal-tracker.md"),
+      continuationPackageText: "Safe package",
+    })
+
+    for (const prompt of [initial, continuation]) {
+      expect(prompt).toContain("First action")
+      expect(prompt).toContain("Missing contract is a reviewer-blocking defect")
+      expect(prompt).toContain("After writing the summary, stop work and return control")
+    }
   })
 })
 
 describe("review prompt shape", () => {
+  test("reviewer prompt separates authoritative facts from worker claims", () => {
+    const project = tempProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
+    const prompt = buildReviewPrompt({
+      loopDir: loop.loopDir,
+      round: 1,
+      summaryPath: join(loop.loopDir, "round-01-summary.md"),
+      summary: "",
+      summaryStatus: "missing",
+      contractPath: join(loop.loopDir, "round-01-contract.md"),
+      contractStatus: "missing",
+    })
+
+    expect(prompt).toContain("Authoritative Facts")
+    expect(prompt).toContain("Worker Claims")
+    expect(prompt).toContain("Summary status: missing")
+    expect(prompt).toContain("Contract status: missing")
+    expect(prompt).toContain("### Claim Audit")
+    expect(prompt).toContain("### Contract Scope Audit")
+    expect(prompt).toContain("Mainline Gaps")
+    expect(prompt).toContain("Blocking Side Issues")
+    expect(prompt).toContain("Queued Side Issues")
+  })
+
   test("full alignment reviews include historical round references and two-state instructions", () => {
     const project = tempProject()
     const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
@@ -681,6 +1090,27 @@ describe("review prompt shape", () => {
     expect(prompt).toContain("Previous round summaries")
     expect(prompt).toContain("### Acceptance Criteria Audit")
     expect(prompt).toContain("PACT_STOP and PACT_CONTINUE are deprecated")
+  })
+
+  test("protects PACT-owned ledgers and state artifacts from worker writes", () => {
+    const loopDir = "/tmp/project/.pact/loops/2026-06-25T00-00-00Z"
+
+    for (const filePath of [
+      `${loopDir}/state.json`,
+      `${loopDir}/plan.md`,
+      `${loopDir}/source-plan.md`,
+      `${loopDir}/todo.md`,
+      `${loopDir}/goal-tracker.md`,
+      `${loopDir}/round-01-context.json`,
+      `${loopDir}/round-01-state.json`,
+      `${loopDir}/round-01-review.md`,
+      `${loopDir}/round-01-review-decision.json`,
+      `${loopDir}/round-01-feedback.md`,
+      `${loopDir}/complete-state.md`,
+      `${loopDir}/stop-state.md`,
+    ]) {
+      expect(isProtectedWrite(filePath)).toBe(true)
+    }
   })
 })
 
@@ -912,6 +1342,37 @@ diff --git a/../../escape b/../../escape
       },
     ])
   })
+
+  test("splits conventional project test files into test patch even without root test.patch", () => {
+    const project = tempGitProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
+    mkdirSync(join(project, "Lib", "test"), { recursive: true })
+    writeFileSync(join(project, "Lib", "test", "test_unparse.py"), "public test edit\n", "utf-8")
+    appendFileSync(join(project, "src.txt"), "after\n", "utf-8")
+
+    const artifact = capturePatchArtifact({
+      projectRoot: project,
+      loopDir: loop.loopDir,
+      loopID: loop.loopID,
+      round: 1,
+    })
+    const evalPatch = readFileSync(join(loop.loopDir, "round-01-eval.patch"), "utf-8")
+    const testPatch = readFileSync(join(loop.loopDir, "round-01-test.patch"), "utf-8")
+
+    expect(artifact.workspace_patch.changed_files).toEqual(["Lib/test/test_unparse.py", "src.txt"])
+    expect(artifact.eval_patch.changed_files).toEqual(["src.txt"])
+    expect(artifact.test_patch.changed_files).toEqual(["Lib/test/test_unparse.py"])
+    expect(evalPatch).not.toContain("Lib/test/test_unparse.py")
+    expect(testPatch).toContain("Lib/test/test_unparse.py")
+    expect(artifact.excluded_test_patch_files).toEqual([
+      {
+        path: "Lib/test/test_unparse.py",
+        sha256: sha256Text("public test edit\n"),
+        bytes: 17,
+        lines: 1,
+      },
+    ])
+  })
 })
 
 describe("parseReviewDecision", () => {
@@ -1042,6 +1503,53 @@ describe("recordReviewDecision", () => {
     expect(feedback).toContain("PACT patch apply check failed")
     expect(feedback).not.toContain("PACT_COMPLETE")
   })
+
+  test("forces reviewer complete to continue when build gate fails", () => {
+    const project = tempProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md", maxRounds: 3 })
+    const verification = writeVerificationArtifact({
+      loopDir: loop.loopDir,
+      round: 1,
+      command: "lolbench gate",
+      status: "failed",
+      buildStatus: "failed",
+      logText: "TestRecord.java:152: error cannot infer type arguments\n",
+      source: "lightweight",
+    })
+
+    const decision = recordReviewDecision({
+      loopDir: loop.loopDir,
+      round: 1,
+      reviewText: "Looks complete.\nPACT_COMPLETE\n",
+      forceContinue: {
+        parseStatus: "build_gate_failed",
+        reason: "build_gate_failed",
+        feedback: "Build gate failed; repair the compile error.",
+        verification,
+      },
+    })
+
+    expect(decision).toMatchObject({
+      marker: "continue",
+      parseStatus: "build_gate_failed",
+      terminalLine: "PACT_COMPLETE",
+    })
+    expect(readState(loop.loopDir)).toMatchObject({
+      status: "running",
+      phase: "implementation",
+      current_round: 2,
+      worker_round_count: 1,
+    })
+    expect(readFileSync(join(loop.loopDir, "round-01-feedback.md"), "utf-8")).toContain("Build gate failed")
+    expect(JSON.parse(readFileSync(join(loop.loopDir, "round-01-review-decision.json"), "utf-8"))).toMatchObject({
+      marker: "continue",
+      raw_marker: "complete",
+      accepted: false,
+      blocked_by: "build_gate",
+      parse_status: "build_gate_failed",
+      verification_ref: artifactPaths(loop.loopDir, 1).verification,
+    })
+  })
 })
 
 describe("failure classification and round results", () => {
@@ -1053,6 +1561,9 @@ describe("failure classification and round results", () => {
     expect(classifyRoundFailure({ patch_apply_status: "failed" })).toBe("patch_apply_failed")
     expect(classifyRoundFailure({ empty_patch: true })).toBe("empty_patch")
     expect(classifyRoundFailure({ tests_failed: true })).toBe("build_test_failed")
+    expect(classifyRoundFailure({ build_gate_failed: true })).toBe("build_gate_failed")
+    expect(classifyRoundFailure({ max_rounds_without_build_success: true })).toBe("max_rounds_without_build_success")
+    expect(classifyRoundFailure({ verification_timeout: true })).toBe("verification_timeout")
     expect(classifyRoundFailure({ timed_out: true })).toBe("agent_timeout")
     expect(classifyRoundFailure({ max_rounds_reached: true })).toBe("max_rounds")
     expect(classifyRoundFailure({ status: "cancelled" })).toBe("cancelled")

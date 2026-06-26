@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript, Bun tests, OpenCode plugin hooks, Node `fs`, Node `crypto`, local git commands for patch capture when SDK diff is insufficient.
 
-**Implementation Status:** Core v1 is implemented in `.opencode/plugins/pact.ts`, `.opencode/plugins/pact/pact-core.ts`, `.opencode/plugins/pact/lolbench-smoke.ts`, `.opencode/plugins/pact/pact-run-driver.ts`, `.opencode/plugins/pact/pact-core.test.ts`, `.opencode/plugins/pact/pact-plugin.test.ts`, `.opencode/plugins/pact/pact-run-driver.test.ts`, and `.opencode/plugins/pact/lolbench-smoke.test.ts`. The LoLBench/run path uses synchronous Codex CLI defaults for planning and review: `planner_backend=codex-cli`, `planner_model=gpt-5.5`, `reviewer_backend=codex-cli`, and `reviewer_model=gpt-5.4-mini`. Both Codex calls run under the target workspace with `cwd=<project_root>` and `-C <project_root>`, isolated from user config with `--ignore-user-config` and medium reasoning. The default LoLBench worker attribution is `worker_backend=opencode-cli`, `worker_model=zai-coding-plan/glm-5-turbo`, and `worker_config_source=mini-swe-agent-env`. The Humanize-style extension adds a structured plan ledger, protected goal tracker, two-state reviewer protocol, full alignment reviews, review phase, finalize phase, and phase-aware artifacts. Latest smoke fixes add an explicit PACT run driver, eval-patch exclusion for files declared by root `test.patch`, and benchmark strict network blocking for OpenCode web/shell tool calls.
+**Implementation Status:** Core v1 is implemented in `.opencode/plugins/pact.ts`, `.opencode/plugins/pact/pact-core.ts`, `.opencode/plugins/pact/lolbench-smoke.ts`, `.opencode/plugins/pact/pact-run-driver.ts`, `.opencode/plugins/pact/pact-core.test.ts`, `.opencode/plugins/pact/pact-plugin.test.ts`, `.opencode/plugins/pact/pact-run-driver.test.ts`, and `.opencode/plugins/pact/lolbench-smoke.test.ts`. The LoLBench/run path uses synchronous Codex CLI defaults for planning and review: `planner_backend=codex-cli`, `planner_model=gpt-5.5`, `reviewer_backend=codex-cli`, and `reviewer_model=gpt-5.4-mini`. Both Codex calls run under the target workspace with `cwd=<project_root>` and `-C <project_root>`, isolated from user config with `--ignore-user-config` and medium reasoning. The default LoLBench worker attribution is `worker_backend=opencode-cli`, `worker_model=zai-coding-plan/glm-5-turbo`, and `worker_config_source=mini-swe-agent-env`. The Humanize-style extension adds a structured plan ledger, protected goal tracker, two-state reviewer protocol, full alignment reviews, review phase, finalize phase, and phase-aware artifacts. The CLI/LoLBench default round boundary is driver-owned `opencode run` exit: the driver starts one worker run per round, captures patch/snapshot/trajectory after process exit, invokes the reviewer synchronously, and writes the next round prompt. `session.idle` remains an interactive fallback. Latest fixes add public-only per-round verification, candidate-only LoLBench hidden final gate artifacts, explicit `next_round` / attempted / completed / reviewed counters, improved failure signatures, streamlined `results.csv`, worker round contracts as claims, worker-safe continuation sanitization, hard worker read guards for reviewer-only `.pact` artifacts, `round-XX-test.patch`, eval-patch exclusion for files declared by root `test.patch`, and benchmark strict network blocking for OpenCode web/shell tool calls.
 
 ## Global Constraints
 
@@ -19,6 +19,10 @@
 - Reviewer parsing is two-state: final `PACT_COMPLETE` advances the phase; missing marker, `PACT_STOP`, and `PACT_CONTINUE` mean continue.
 - PACT bookkeeping files under `.pact/**`, root `solution.patch`, root `test.patch`, and files declared inside root `test.patch` must not appear in eval/final captured patch files.
 - Excluded root benchmark scaffolding files are recorded as metadata, never included in eval/workspace patch content.
+- Worker-facing continuation packages and next-worker instructions must not include raw verification log tails, `eval_tests.patch`, F2P/P2P details, hidden/eval suite details, final hidden gate artifacts, Docker grade logs, benchmark harness paths, or benchmark command lines.
+- LoLBench per-round verification is public/worker-safe only. Hidden `pact-gate` runs only after reviewer candidate `PACT_COMPLETE`, writes final hidden artifacts, and never feeds worker continuation.
+- In benchmark strict mode, worker tool reads may only access worker-safe `.pact` files such as `plan.md`, `todo.md`, `goal-tracker.md`, source plan, round prompts, round contracts, round summaries, continuation packages, and pre-snapshots. Reviewer-only artifacts such as feedback, verification, replay, events, evidence, trajectory, review files, and captured patches stay available to the driver/reviewer/human reports but are blocked from worker reads.
+- `plan.md`, `source-plan.md`, `todo.md`, `goal-tracker.md`, review artifacts, state artifacts, result artifacts, and replay artifacts are PACT-owned. Workers request ledger updates in summaries; reviewers approve or reject; PACT applies approved mutable updates.
 - LoLBench/OpenCode run defaults must not depend on OpenCode provider discovery for planner or reviewer calls.
 - LoLBench/OpenCode smoke must inject the ZAI Coding Plan custom provider from mini-swe-agent env placeholders instead of treating `zai-coding-plan/glm-5-turbo` as a built-in registry model.
 
@@ -36,8 +40,40 @@
   - Add helpers for env validation, ZAI provider config generation, worker model normalization, and config-content merge.
 - Add `.opencode/plugins/pact/lolbench-smoke.test.ts`
   - Add tests that provider config uses env placeholders and does not embed secrets.
+- Modify `.opencode/plugins/pact/pact-run-driver.ts`
+  - Make CLI/LoLBench default to driver-owned `opencode run` once per round; after process exit the driver captures artifacts and runs review synchronously.
+- Modify `.opencode/plugins/pact/pact-run-driver.test.ts`
+  - Add coverage for run-exit round finalization, missing summary review, and same-session opt-in compatibility.
 - Keep `.opencode/agent/pact-*.md` unchanged unless implementation reveals a prompt-only gap.
 - Keep docs in `docs/pact/` as design and implementation handoff.
+
+## Driver-Owned Round Lifecycle Update
+
+**Default boundary:** `round_boundary=run_exit` for CLI and LoLBench. One `opencode run` process equals one worker round. When the process exits, the driver:
+
+- captures the driver invocation in `round-XX-trajectory.json`;
+- tolerates missing `round-XX-summary.md` and records `summary_status=missing`;
+- reads `round-XX-contract.md` if present and treats it as a worker claim;
+- captures workspace/eval/test patches and patch metadata;
+- runs configured public/worker-safe verification without applying hidden eval tests or feeding raw final/eval details back to the worker;
+- builds a reviewer prompt with separate `Authoritative Facts` and `Worker Claims`;
+- writes review, decision, result, evidence, replay, and the next round prompt synchronously.
+
+If the reviewer writes candidate `PACT_COMPLETE` during implementation/full-alignment, the driver then runs the LoLBench hidden final gate (`pact-gate`) for the configured suites and writes `final-hidden-gate-<suite>.json`, `final-hidden-gate-<suite>.log`, `final-hidden-gate-summary.json`, and `final-result.json`. Hidden final failure stops the loop with `stop_reason=final_hidden_gate_failed` and does not create a continuation prompt.
+
+**Fallback boundary:** `session.idle` remains for interactive OpenCode server usage and continues to use the same core artifact helpers.
+
+**Worker contract:** Every implementation/continuation prompt asks the worker to write `round-XX-contract.md` before coding, including a single mainline objective, target ACs, blocking issues, queued out-of-scope issues, and success criteria. The contract is not trusted as evidence; reviewer audits it under `Claim Audit` and `Contract Scope Audit`.
+
+**Worker-safe feedback:** `writeContinuationPackage` and next-worker instructions sanitize benchmark/eval-only facts. Full verification artifacts remain available for human/report consumers, but the next worker prompt receives only safe, source-oriented guidance.
+
+**Patch separation:** `round-XX-workspace.patch` is observability-oriented, `round-XX-eval.patch` is product/source evaluation-oriented, and `round-XX-test.patch` contains worker/public test changes inferred from root `test.patch` declarations. `.pact/**`, root `solution.patch`, root `test.patch`, and root `*.patch`/`*.diff` scaffolding stay out of eval patches.
+
+**PACT container-worker v1:** the LoLBench host path can now keep the PACT driver on the host while running each worker round inside an eval-derived Docker image. LoLBench `--pact-container-worker` builds/exposes the private-stripped agent image with `build_agent_image(...)`, sets `PACT_WORKER_RUNNER=docker`, and passes `LOLBENCH_AGENT_IMAGE_TAG` to the driver. The driver can also be called directly with `--worker-runner docker` or `PACT_WORKER_RUNNER=docker`. Docker worker runs inherit `LOLBENCH_MEM` / `LOLBENCH_CPUS`, bind-mount the host workspace read-write, mount the PACT plugin bundle read-only, rewrite worker-side `OPENCODE_CONFIG_CONTENT`, and leave reviewer/reporting/final gate execution on the host.
+
+**Host-flow prerequisite now fixed:** the CLI driver owns Round00 initialization directly. It creates the loop, runs planner/repair, writes canonical `plan.md` / `todo.md` / `goal-tracker.md`, and only then launches the first worker with `round-01-prompt.md`. The first worker run no longer has to call `pact-start-loop`. If the planner fails, PACT writes `planner-error.md` and `round-00-result.json` with `planner_failed` before any worker invocation, which prevents silent empty-patch runs.
+
+**Latest host smoke note:** a `glm-5-turbo` one-case host smoke on `Ruff_Issue-8368_Allow-override-of-configuration-options-via-the-CLI_PR-9599` reached Round00 and Round01, enforced `round_boundary=run_exit`, blocked Task delegation, allowed only worker-safe `.pact` reads, produced source edits, and timed out at the outer LoLBench agent timeout before the worker wrote summary or exited. LoLBench archived `.pact` to the run directory, wrote `pact_status=stopped`, `pact_phase=stopped`, `failure_category=agent_timeout`, and produced a `solution.patch` without `.pact`/eval-detail pollution. This confirms the host artifact boundary but also shows that a quick smoke cannot rely on natural worker exit for long-horizon cases; container-worker should preserve host-owned timeout/cleanup and artifact archive behavior.
 
 ## Task 1: Artifact Paths and JSON Writers
 
@@ -240,7 +276,7 @@
 - [x] Run `bun typecheck` from `packages/opencode`.
 - [x] Run `bun run lint -- .opencode/plugins/pact.ts .opencode/plugins/pact/pact-core.ts .opencode/plugins/pact/pact-core.test.ts .opencode/plugins/pact/pact-plugin.test.ts`; exits 0 with existing unsafe assertion/no-base-to-string warnings.
 - [x] Run `git diff --check`.
-- [x] Run LoLBench smoke through OpenCode with `zai-coding-plan/glm-5-turbo` worker and `codex-cli` reviewer using `gpt-5.4-mini`; latest code adds unit coverage for reviewer timeout/model metadata after that smoke.
+- [x] Run LoLBench smoke through OpenCode with ZAI Coding Plan worker and `codex-cli` reviewer using `gpt-5.4-mini`; latest code adds unit coverage for reviewer timeout/model metadata after that smoke.
 - [x] Run max-rounds=5 LoLBench smoke. Result: planner previously fell back because it still used an OpenCode subagent and hit `no providers found`; this plan now fixes planner to default to synchronous Codex CLI with `gpt-5.5`.
 - [x] Add unit coverage for ZAI Coding Plan provider config generation, mini-swe model mapping, coding endpoint validation, and secret-free config merging.
 - [x] Confirm `docs/pact/opencode-pact-observability-replay-v1.md` still matches the implemented artifact names.
@@ -394,6 +430,29 @@
 - [ ] Keep `state.json` and `replay-case.json` as latest pointers/copies, but document that replay should prefer `round-XX-replay-case.json`.
 - [ ] Add tests proving default loops do not create `.round-history`, while debug-enabled loops create it only when requested.
 - [ ] Update artifact documentation to remove the "two authoritative copies" ambiguity and explain top-level-only replay inspection.
+
+## Task 19: Public Round Verification and Final Hidden Gate
+
+**Files:**
+
+- Modify: `.opencode/plugins/pact/pact-core.ts`
+- Modify: `.opencode/plugins/pact/pact-run-driver.ts`
+- Modify: `.opencode/plugins/pact/pact-run-driver.test.ts`
+- Modify: `/Users/gujiazhen/Documents/cc_codes/benchmark/LoLBench/scripts/lolbench_eval.py`
+- Modify: `/Users/gujiazhen/Documents/cc_codes/benchmark/LoLBench/scripts/test_lolbench_eval.py`
+- Modify: `docs/pact/opencode-pact-observability-replay-v1.md`
+- Modify: `docs/pact/opencode-pact-observability-replay-v1-implementation-plan.md`
+
+- [x] Change LoLBench default per-round verification from hidden `pact-gate` to worker-safe `pact-public-check`.
+- [x] Add LoLBench `pact-public-check` mode that reads PACT patch apply metadata and optionally runs an explicit public build/check command.
+- [x] Run LoLBench hidden `pact-gate` only after reviewer candidate `PACT_COMPLETE`.
+- [x] Write `final-hidden-gate-<suite>.json`, `final-hidden-gate-<suite>.log`, `final-hidden-gate-summary.json`, and `final-result.json`.
+- [x] Stop unresolved hidden-final failures with `stop_reason=final_hidden_gate_failed` and no continuation prompt.
+- [x] Add `next_round`, `attempted_worker_rounds`, `completed_worker_rounds`, and `reviewed_worker_rounds` while keeping `current_round` and `worker_round_count` as compatibility aliases.
+- [x] Make max-round and reporting logic use completed/reviewed worker counters rather than the round cursor.
+- [x] Improve LoLBench failure signatures so JSON tail braces are skipped and structured report facts are preferred.
+- [x] Streamline default `results.csv`; write deprecated aliases and debug refs to `results.verbose.csv`.
+- [x] Add tests for public default verification, final hidden gate failure, reviewer failure counters, signature extraction, PACT summary counters, and CSV headers.
 
 ## Commit Plan
 

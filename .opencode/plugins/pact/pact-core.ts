@@ -20,14 +20,19 @@ export type LoopPhase = "implementation" | "full_alignment" | "review" | "finali
 export type ReviewMarker = "complete" | "continue"
 export type SessionStrategy = "new-per-round" | "same-session"
 export type TrajectoryMode = "structured" | "full-redact"
+export type RoundBoundary = "session_idle" | "run_exit"
 
 export type PactState = {
   version: 1 | 2
   status: LoopStatus
   phase: LoopPhase
   loop_id: string
+  next_round?: number
   current_round: number
   max_rounds: number
+  attempted_worker_rounds?: number
+  completed_worker_rounds?: number
+  reviewed_worker_rounds?: number
   worker_round_count?: number
   full_alignment_interval: number
   plan_file: string
@@ -37,6 +42,7 @@ export type PactState = {
   active_round_session_id?: string
   previous_round_session_id?: string
   session_strategy?: SessionStrategy
+  round_boundary?: RoundBoundary
   trajectory_mode?: TrajectoryMode
   planner_backend: PlannerBackend
   planner_model?: string | null
@@ -45,6 +51,8 @@ export type PactState = {
   worker_backend?: string
   worker_model?: string | null
   worker_config_source?: string | null
+  verification_command?: string
+  verification_timeout_ms?: number
   goal_tracker_immutable_sha256?: string
   base_commit?: string
   created_at: string
@@ -52,6 +60,11 @@ export type PactState = {
   last_review_marker?: ReviewMarker
   last_review_path?: string
   last_feedback_path?: string
+  latest_build_success_round?: number
+  first_public_build_success_round?: number
+  last_verification_status?: VerificationStatus
+  last_verification_build_status?: string
+  stop_reason?: FailureCategory | string
 }
 
 export type LoopInfo = {
@@ -74,9 +87,12 @@ export type CreateLoopInput = {
   workerConfigSource?: string | null
   workerSessionID?: string
   sessionStrategy?: SessionStrategy
+  roundBoundary?: RoundBoundary
   trajectoryMode?: TrajectoryMode
   fullAlignmentInterval?: number
   baseCommit?: string
+  verificationCommand?: string
+  verificationTimeoutMs?: number
 }
 
 export type PlannerArtifacts = {
@@ -123,6 +139,7 @@ export type ReviewDecision = {
     | "reviewer_timeout"
     | "reviewer_failed"
     | "patch_apply_failed"
+    | "build_gate_failed"
   terminalLine: string
 }
 
@@ -138,7 +155,12 @@ export type ArtifactPaths = {
   evidenceMarkdown: string
   workspacePatch: string
   evalPatch: string
+  testPatch: string
   patchArtifact: string
+  verification: string
+  verificationLog: string
+  continuationPackage: string
+  continuationPackageJson: string
   reviewDecision: string
   roundResult: string
   roundReplayCase: string
@@ -256,6 +278,7 @@ export type PatchArtifact = {
   primary_patch: "eval"
   workspace_patch: PatchMetadata
   eval_patch: PatchMetadata
+  test_patch: PatchMetadata
   excluded_scaffolding_files?: ExcludedScaffoldingFile[]
   excluded_test_patch_files?: ExcludedScaffoldingFile[]
   checks: {
@@ -264,6 +287,57 @@ export type PatchArtifact = {
       command: string
       stderr?: string
     }
+  }
+}
+
+export type VerificationStatus = "not_run" | "passed" | "failed" | "timeout" | "infra_failed"
+
+export type VerificationCounts = {
+  passed: number
+  total: number
+}
+
+export type RoundVerificationArtifact = {
+  schema: "pact-round-verification/v1"
+  artifact_version: 1
+  round: number
+  created_at: string
+  command?: string
+  source?: "lightweight" | "finalize"
+  status: VerificationStatus
+  exit_code?: number | null
+  duration_ms?: number
+  patch_sha256?: string
+  applied?: boolean
+  resolved?: boolean
+  build_status?: string
+  f2p?: VerificationCounts
+  p2p?: VerificationCounts
+  error_categories?: string[]
+  failure_signature?: string
+  log_path: string
+  log_tail?: string
+}
+
+export type ContinuationPackageArtifact = {
+  schema: "pact-continuation-package/v1"
+  artifact_version: 1
+  round: number
+  next_round: number
+  created_at: string
+  loop_phase: LoopPhase
+  worker_round_count: number
+  max_rounds: number
+  remaining_worker_rounds: number
+  patch_sha256?: string
+  changed_files: string[]
+  latest_failure_signature?: string
+  next_worker_instruction?: string
+  feedback_path?: string
+  verification?: {
+    status: VerificationStatus
+    build_status?: string
+    path: string
   }
 }
 
@@ -276,6 +350,9 @@ export type FailureCategory =
   | "malformed_patch"
   | "patch_apply_failed"
   | "build_test_failed"
+  | "build_gate_failed"
+  | "max_rounds_without_build_success"
+  | "verification_timeout"
   | "agent_timeout"
   | "max_rounds"
   | "cancelled"
@@ -299,6 +376,12 @@ export type FailureClassificationInput = {
   buildFailed?: boolean
   tests_failed?: boolean
   testsFailed?: boolean
+  build_gate_failed?: boolean
+  buildGateFailed?: boolean
+  max_rounds_without_build_success?: boolean
+  maxRoundsWithoutBuildSuccess?: boolean
+  verification_timeout?: boolean
+  verificationTimeout?: boolean
   timed_out?: boolean
   timedOut?: boolean
   max_rounds_reached?: boolean
@@ -338,6 +421,10 @@ export type ReviewDecisionArtifact = {
   terminal_line: string
   review_path: string
   feedback_path?: string
+  raw_marker?: ReviewMarker
+  accepted?: boolean
+  blocked_by?: "patch_apply" | "build_gate"
+  verification_ref?: string
   reviewer_backend?: ReviewerBackend
   reviewer_model?: string | null
   resulting_status: LoopStatus
@@ -393,6 +480,8 @@ export type ReplayCaseArtifact = {
   }
   trajectory?: unknown
   evidence?: unknown
+  verification?: RoundVerificationArtifact
+  continuation_package?: ContinuationPackageArtifact
   context: RoundContextArtifact
   patch: PatchArtifact
   review: ReviewDecisionArtifact
@@ -429,7 +518,12 @@ export function artifactPaths(loopDir: string, round: number): ArtifactPaths {
     evidenceMarkdown: join(loopDir, `${roundPrefix}-evidence.md`),
     workspacePatch: join(loopDir, `${roundPrefix}-workspace.patch`),
     evalPatch: join(loopDir, `${roundPrefix}-eval.patch`),
+    testPatch: join(loopDir, `${roundPrefix}-test.patch`),
     patchArtifact: join(loopDir, `${roundPrefix}-patch-artifact.json`),
+    verification: join(loopDir, `${roundPrefix}-verification.json`),
+    verificationLog: join(loopDir, `${roundPrefix}-verification.log`),
+    continuationPackage: join(loopDir, `${roundPrefix}-continuation-package.md`),
+    continuationPackageJson: join(loopDir, `${roundPrefix}-continuation-package.json`),
     reviewDecision: join(loopDir, `${roundPrefix}-review-decision.json`),
     roundResult: join(loopDir, `${roundPrefix}-result.json`),
     roundReplayCase: join(loopDir, `${roundPrefix}-replay-case.json`),
@@ -472,22 +566,78 @@ export function readState(loopDir: string): PactState {
   const state = JSON.parse(readFileSync(join(loopDir, "state.json"), "utf-8")) as PactState
   state.phase ??= state.status === "complete" ? "complete" : state.status === "stopped" ? "stopped" : "implementation"
   state.full_alignment_interval ??= 5
-  state.worker_round_count ??= Math.max(0, state.current_round - 1)
+  const legacyRoundCount =
+    state.worker_round_count ?? Math.max(0, Math.max(1, Number(state.current_round) || 1) - 1)
+  state.next_round ??= state.current_round ?? 1
+  state.current_round = state.next_round
+  state.attempted_worker_rounds ??= legacyRoundCount
+  state.completed_worker_rounds ??= legacyRoundCount
+  state.reviewed_worker_rounds ??= legacyRoundCount
+  state.worker_round_count ??= state.completed_worker_rounds
   state.session_strategy ??= "same-session"
+  state.round_boundary ??= "session_idle"
   state.trajectory_mode ??= "structured"
   state.active_round_session_id ??= state.active_session_id
   return state
 }
 
 export function writeState(loopDir: string, state: PactState): void {
+  if (state.next_round === undefined || state.current_round !== state.next_round) {
+    state.next_round = state.current_round
+  }
+  state.current_round = state.next_round
+  if (state.worker_round_count !== undefined && state.worker_round_count !== state.completed_worker_rounds) {
+    state.completed_worker_rounds = state.worker_round_count
+    state.reviewed_worker_rounds = Math.max(state.reviewed_worker_rounds ?? 0, state.worker_round_count)
+    state.attempted_worker_rounds = Math.max(state.attempted_worker_rounds ?? 0, state.worker_round_count)
+  }
+  state.worker_round_count = state.completed_worker_rounds ?? state.worker_round_count ?? 0
   state.updated_at = new Date().toISOString()
   writeFileSync(join(loopDir, "state.json"), JSON.stringify(state, null, 2) + "\n", "utf-8")
 }
 
+export function markWorkerRoundAttempted(loopDir: string, round: number): PactState {
+  const state = readState(loopDir)
+  markStateWorkerRoundAttempted(state, round)
+  writeState(loopDir, state)
+  return state
+}
+
+export function markWorkerRoundCompleted(loopDir: string, round: number): PactState {
+  const state = readState(loopDir)
+  markStateWorkerRoundAttempted(state, round)
+  markStateWorkerRoundCompleted(state, round)
+  writeState(loopDir, state)
+  return state
+}
+
+function markStateWorkerRoundAttempted(state: PactState, round: number): void {
+  state.attempted_worker_rounds = Math.max(state.attempted_worker_rounds ?? 0, round)
+}
+
+function markStateWorkerRoundCompleted(state: PactState, round: number): void {
+  state.completed_worker_rounds = Math.max(state.completed_worker_rounds ?? 0, round)
+  state.worker_round_count = state.completed_worker_rounds
+}
+
+function markStateWorkerRoundReviewed(state: PactState, round: number): void {
+  state.reviewed_worker_rounds = Math.max(state.reviewed_worker_rounds ?? 0, round)
+}
+
+function setNextRoundCursor(state: PactState, round: number): void {
+  state.next_round = round
+  state.current_round = round
+}
+
 export function createLoop(input: CreateLoopInput): LoopInfo {
   const now = input.now ?? new Date()
-  const loopID = formatLoopID(now)
-  const loopDir = join(input.projectRoot, ".pact", "loops", loopID)
+  const baseLoopID = formatLoopID(now)
+  let loopID = baseLoopID
+  let loopDir = join(input.projectRoot, ".pact", "loops", loopID)
+  for (let attempt = 2; existsSync(loopDir); attempt++) {
+    loopID = `${baseLoopID}-${String(attempt).padStart(2, "0")}`
+    loopDir = join(input.projectRoot, ".pact", "loops", loopID)
+  }
   for (const pattern of GIT_INFO_EXCLUDE_PATTERNS) {
     ensureGitInfoExclude(input.projectRoot, pattern)
   }
@@ -506,6 +656,7 @@ export function createLoop(input: CreateLoopInput): LoopInfo {
   const goalTrackerImmutableSha = goalTrackerImmutableSha256(readFileSync(join(loopDir, "goal-tracker.md"), "utf-8"))
   const baseCommit = input.baseCommit ?? currentHeadCommit(input.projectRoot)
   const sessionStrategy = input.sessionStrategy ?? "new-per-round"
+  const roundBoundary = input.roundBoundary ?? "session_idle"
   const trajectoryMode = input.trajectoryMode ?? "full-redact"
 
   const state: PactState = {
@@ -513,8 +664,12 @@ export function createLoop(input: CreateLoopInput): LoopInfo {
     status: "running",
     phase: "implementation",
     loop_id: loopID,
+    next_round: 1,
     current_round: 1,
     max_rounds: input.maxRounds ?? 8,
+    attempted_worker_rounds: 0,
+    completed_worker_rounds: 0,
+    reviewed_worker_rounds: 0,
     worker_round_count: 0,
     full_alignment_interval: Math.max(2, input.fullAlignmentInterval ?? 5),
     plan_file: input.planFile,
@@ -523,6 +678,7 @@ export function createLoop(input: CreateLoopInput): LoopInfo {
     active_session_id: input.workerSessionID,
     active_round_session_id: input.workerSessionID,
     session_strategy: sessionStrategy,
+    round_boundary: roundBoundary,
     trajectory_mode: trajectoryMode,
     planner_backend: input.plannerBackend ?? "codex-cli",
     planner_model: input.plannerModel,
@@ -531,6 +687,8 @@ export function createLoop(input: CreateLoopInput): LoopInfo {
     worker_backend: input.workerBackend,
     worker_model: input.workerModel,
     worker_config_source: input.workerConfigSource,
+    verification_command: input.verificationCommand,
+    verification_timeout_ms: input.verificationTimeoutMs,
     goal_tracker_immutable_sha256: goalTrackerImmutableSha,
     base_commit: baseCommit,
     created_at: now.toISOString(),
@@ -548,8 +706,14 @@ export function createLoop(input: CreateLoopInput): LoopInfo {
     plan_sha256: sha256Text(readFileSync(join(loopDir, "plan.md"), "utf-8")),
     round0_enabled: true,
     max_rounds: state.max_rounds,
+    next_round: state.next_round,
+    current_round_deprecated_alias: state.current_round,
+    attempted_worker_rounds: state.attempted_worker_rounds,
+    completed_worker_rounds: state.completed_worker_rounds,
+    reviewed_worker_rounds: state.reviewed_worker_rounds,
     full_alignment_interval: state.full_alignment_interval,
     session_strategy: sessionStrategy,
+    round_boundary: roundBoundary,
     trajectory_mode: trajectoryMode,
     phase_config: {
       implementation: true,
@@ -557,7 +721,7 @@ export function createLoop(input: CreateLoopInput): LoopInfo {
       review: true,
       finalize: true,
       stop_hook: false,
-      gate: "session.idle",
+      gate: roundBoundary,
     },
     planner_backend: state.planner_backend,
     planner_model: state.planner_model,
@@ -566,6 +730,9 @@ export function createLoop(input: CreateLoopInput): LoopInfo {
     worker_backend: state.worker_backend,
     worker_model: state.worker_model,
     worker_config_source: state.worker_config_source,
+    verification_enabled: Boolean(state.verification_command),
+    verification_command: state.verification_command,
+    verification_timeout_ms: state.verification_timeout_ms,
     goal_tracker_immutable_sha256: state.goal_tracker_immutable_sha256,
     base_commit: state.base_commit,
     active_session_id: state.active_session_id,
@@ -749,18 +916,21 @@ export function capturePatchArtifact(input: {
 }): PatchArtifact {
   const paths = artifactPaths(input.loopDir, input.round)
   const workspaceExcludes = patchCaptureExcludePathspecs()
-  const testPatchPaths = collectRootTestPatchPaths(input.projectRoot)
+  const testPatchPaths = collectTestPatchPaths(input.projectRoot, workspaceExcludes)
   const evalExcludes = [...workspaceExcludes, ...testPatchPaths.map((filePath) => `:(exclude)${filePath}`)]
   const workspaceCapture = captureGitPatch(input.projectRoot, workspaceExcludes)
   const evalCapture = captureGitPatch(input.projectRoot, evalExcludes)
+  const testCapture = captureGitPatchForPaths(input.projectRoot, testPatchPaths)
   const excludedScaffoldingFiles = collectExcludedScaffoldingFiles(input.projectRoot)
   const excludedTestPatchFiles = collectPathMetadata(input.projectRoot, testPatchPaths)
   const applyCheck = checkPatchApplies(input.projectRoot, evalCapture.patchText)
 
   writeFileSync(paths.workspacePatch, workspaceCapture.patchText, "utf-8")
   writeFileSync(paths.evalPatch, evalCapture.patchText, "utf-8")
+  writeFileSync(paths.testPatch, testCapture.patchText, "utf-8")
   const workspaceMetadata = patchMetadata(paths.workspacePatch, workspaceCapture.patchText, workspaceCapture.changedFiles)
   const evalMetadata = patchMetadata(paths.evalPatch, evalCapture.patchText, evalCapture.changedFiles)
+  const testMetadata = patchMetadata(paths.testPatch, testCapture.patchText, testCapture.changedFiles)
   const artifact: PatchArtifact = {
     schema: "pact-patch-artifact/v1",
     artifact_version: 1,
@@ -770,6 +940,7 @@ export function capturePatchArtifact(input: {
     primary_patch: "eval",
     workspace_patch: workspaceMetadata,
     eval_patch: evalMetadata,
+    test_patch: testMetadata,
     excluded_scaffolding_files: excludedScaffoldingFiles,
     excluded_test_patch_files: excludedTestPatchFiles,
     checks: {
@@ -790,7 +961,12 @@ export function classifyRoundFailure(input: FailureClassificationInput): Failure
   if (input.patch_apply_status === "failed" || input.patchApplyStatus === "failed") return "patch_apply_failed"
   if (input.empty_patch || input.emptyPatch) return "empty_patch"
   if (input.build_failed || input.buildFailed || input.tests_failed || input.testsFailed) return "build_test_failed"
+  if (input.build_gate_failed || input.buildGateFailed) return "build_gate_failed"
+  if (input.verification_timeout || input.verificationTimeout) return "verification_timeout"
   if (input.timed_out || input.timedOut) return "agent_timeout"
+  if (input.max_rounds_without_build_success || input.maxRoundsWithoutBuildSuccess) {
+    return "max_rounds_without_build_success"
+  }
   if (input.max_rounds_reached || input.maxRoundsReached) return "max_rounds"
   return "unknown"
 }
@@ -822,6 +998,13 @@ export function writeRoundResult(input: {
         ? null
         : classifyRoundFailure(input.failure ?? {})
   const state = existsSync(join(input.loopDir, "state.json")) ? readState(input.loopDir) : undefined
+  const metrics: Record<string, string | number | boolean | null> = {
+    next_round: state?.next_round ?? null,
+    attempted_worker_rounds: state?.attempted_worker_rounds ?? null,
+    completed_worker_rounds: state?.completed_worker_rounds ?? null,
+    reviewed_worker_rounds: state?.reviewed_worker_rounds ?? null,
+    ...(input.metrics ?? {}),
+  }
   const artifact: RoundResultArtifact = {
     schema: "pact-round-result/v1",
     artifact_version: 1,
@@ -839,7 +1022,7 @@ export function writeRoundResult(input: {
     worker_backend: input.workerBackend ?? state?.worker_backend,
     worker_model: input.workerModel ?? state?.worker_model,
     worker_config_source: input.workerConfigSource ?? state?.worker_config_source,
-    metrics: input.metrics ?? {},
+    metrics,
     artifacts: input.artifacts ?? defaultRoundArtifacts(input.loopDir, input.round),
   }
   writeJsonFile(artifactPaths(input.loopDir, input.round).roundResult, stripUndefined(artifact))
@@ -938,7 +1121,12 @@ export function writeRoundEvidence(input: { loopDir: string; round: number; time
     feedback: join(input.loopDir, `round-${roundName(input.round)}-feedback.md`),
     review: join(input.loopDir, `round-${roundName(input.round)}-review.md`),
     eval_patch: paths.evalPatch,
+    test_patch: paths.testPatch,
     patch_artifact: paths.patchArtifact,
+    verification: paths.verification,
+    verification_log: paths.verificationLog,
+    continuation_package: paths.continuationPackage,
+    continuation_package_json: paths.continuationPackageJson,
     review_decision: paths.reviewDecision,
     result: paths.roundResult,
     pre_snapshot: paths.preSnapshot,
@@ -977,6 +1165,128 @@ export function writeRoundEvidence(input: { loopDir: string; round: number; time
   return artifact
 }
 
+export function writeVerificationArtifact(input: {
+  loopDir: string
+  round: number
+  command?: string
+  status: VerificationStatus
+  exitCode?: number | null
+  durationMs?: number
+  patchSha256?: string
+  applied?: boolean
+  resolved?: boolean
+  buildStatus?: string
+  f2p?: VerificationCounts
+  p2p?: VerificationCounts
+  errorCategories?: string[]
+  failureSignature?: string
+  logText?: string
+  source?: RoundVerificationArtifact["source"]
+  time?: string
+}): RoundVerificationArtifact {
+  const paths = artifactPaths(input.loopDir, input.round)
+  const logText = redactText(input.logText ?? "")
+  writeFileSync(paths.verificationLog, logText, "utf-8")
+  const logTail = tailLines(logText, 80)
+  const artifact = stripUndefined({
+    schema: "pact-round-verification/v1",
+    artifact_version: 1,
+    round: input.round,
+    created_at: input.time ?? new Date().toISOString(),
+    command: input.command,
+    source: input.source,
+    status: input.status,
+    exit_code: input.exitCode,
+    duration_ms: input.durationMs,
+    patch_sha256: input.patchSha256,
+    applied: input.applied,
+    resolved: input.resolved,
+    build_status: input.buildStatus,
+    f2p: input.f2p,
+    p2p: input.p2p,
+    error_categories: input.errorCategories,
+    failure_signature: input.failureSignature ?? firstUsefulLine(logTail),
+    log_path: paths.verificationLog,
+    log_tail: logTail || undefined,
+  } satisfies RoundVerificationArtifact)
+  writeJsonFile(paths.verification, artifact)
+  return artifact
+}
+
+export function writeContinuationPackage(input: {
+  loopDir: string
+  round: number
+  nextRound: number
+  maxRounds: number
+  workerRoundCount: number
+  loopPhase: LoopPhase
+  reviewText?: string
+  verification?: RoundVerificationArtifact
+  changedFiles?: string[]
+  patchSha256?: string
+  feedbackPath?: string
+  time?: string
+}): { artifact: ContinuationPackageArtifact; markdown: string } {
+  const paths = artifactPaths(input.loopDir, input.round)
+  const remainingWorkerRounds = Math.max(0, input.maxRounds - input.workerRoundCount)
+  const rawNextWorkerInstruction = extractNextWorkerInstruction(input.reviewText ?? "")
+  const nextWorkerInstruction = workerSafeNextInstruction(rawNextWorkerInstruction, {
+    verification: input.verification,
+    changedFiles: input.changedFiles ?? [],
+  })
+  const latestFailureSignature = workerSafeFailureSignature(input.verification?.failure_signature)
+  const artifact = stripUndefined({
+    schema: "pact-continuation-package/v1",
+    artifact_version: 1,
+    round: input.round,
+    next_round: input.nextRound,
+    created_at: input.time ?? new Date().toISOString(),
+    loop_phase: input.loopPhase,
+    worker_round_count: input.workerRoundCount,
+    max_rounds: input.maxRounds,
+    remaining_worker_rounds: remainingWorkerRounds,
+    patch_sha256: input.patchSha256,
+    changed_files: input.changedFiles ?? [],
+    latest_failure_signature: latestFailureSignature,
+    next_worker_instruction: nextWorkerInstruction,
+    verification: input.verification
+      ? {
+          status: input.verification.status,
+          build_status: input.verification.build_status,
+        }
+      : undefined,
+  } satisfies ContinuationPackageArtifact)
+  const markdown = [
+    `# PACT Round ${roundName(input.round)} Continuation Package`,
+    "",
+    "## Current Round Package Summary",
+    `- Loop phase: ${input.loopPhase}`,
+    `- Worker rounds used: ${input.workerRoundCount}/${input.maxRounds}`,
+    `- Remaining worker rounds: ${remainingWorkerRounds}`,
+    input.patchSha256 ? `- Patch SHA-256: ${input.patchSha256}` : undefined,
+    input.changedFiles?.length ? `- Changed files: ${input.changedFiles.join(", ")}` : "- Changed files: (none)",
+    input.verification
+      ? `- Verification: ${input.verification.status}${input.verification.build_status ? ` / build=${input.verification.build_status}` : ""}`
+      : "- Verification: not run",
+    latestFailureSignature ? `- Latest failure signature: ${latestFailureSignature}` : undefined,
+    "",
+    "## Latest Reviewer Findings",
+    compactReviewFindings(input.reviewText ?? "") || "(none)",
+    "",
+    "## Worker Boundary",
+    "Do not modify PACT artifacts or run gates. Make workspace-only source changes; PACT will recapture patches and run verification after the round.",
+    "",
+    "## Next Worker Instruction",
+    nextWorkerInstruction || "(none)",
+    "",
+  ]
+    .filter((line): line is string => line !== undefined)
+    .join("\n")
+  writeJsonFile(paths.continuationPackageJson, artifact)
+  writeFileSync(paths.continuationPackage, markdown, "utf-8")
+  return { artifact, markdown }
+}
+
 export function exportReplayCase(input: {
   loopDir: string
   round?: number
@@ -1004,6 +1314,10 @@ export function exportReplayCase(input: {
   const postSnapshot = existsSync(paths.postSnapshot) ? readJsonFile<unknown>(paths.postSnapshot) : undefined
   const trajectory = existsSync(paths.trajectory) ? readJsonFile<unknown>(paths.trajectory) : undefined
   const evidence = existsSync(paths.evidenceJson) ? readJsonFile<unknown>(paths.evidenceJson) : undefined
+  const verification = existsSync(paths.verification) ? readJsonFile<RoundVerificationArtifact>(paths.verification) : undefined
+  const continuationPackage = existsSync(paths.continuationPackageJson)
+    ? readJsonFile<ContinuationPackageArtifact>(paths.continuationPackageJson)
+    : undefined
   const plan = {
     path: planPath,
     sha256: sha256Text(planText),
@@ -1057,6 +1371,8 @@ export function exportReplayCase(input: {
     }),
     trajectory,
     evidence,
+    verification,
+    continuation_package: continuationPackage,
     context,
     patch,
     review,
@@ -1101,10 +1417,13 @@ export function parsePlannerArtifacts(text: string): PlannerArtifacts {
   const plan = extractBlock(text, "PACT_PLAN")
   const todo = extractBlock(text, "PACT_TODO")
   const goalTracker = extractBlock(text, "PACT_GOAL_TRACKER")
+  const sanitizedPlan = plan ? sanitizePlannerArtifactText(plan) : undefined
+  const sanitizedTodo = sanitizePlannerArtifactText(todo ?? defaultTodo())
+  const sanitizedGoalTracker = sanitizePlannerArtifactText(goalTracker ?? defaultGoalTracker("plan.md"))
   return {
-    plan: plan?.trim() ? plan.trim() + "\n" : undefined,
-    todo: normalizeTodoArtifact(todo ?? defaultTodo()).trim() + "\n",
-    goalTracker: normalizeGoalTrackerArtifact(goalTracker ?? defaultGoalTracker("plan.md"), "plan.md").trim() + "\n",
+    plan: sanitizedPlan?.trim() ? sanitizedPlan.trim() + "\n" : undefined,
+    todo: normalizeTodoArtifact(sanitizedTodo).trim() + "\n",
+    goalTracker: normalizeGoalTrackerArtifact(sanitizedGoalTracker, "plan.md").trim() + "\n",
     markerPresence: {
       plan: plan !== undefined,
       todo: todo !== undefined,
@@ -1115,12 +1434,12 @@ export function parsePlannerArtifacts(text: string): PlannerArtifacts {
 
 export function applyPlannerArtifacts(loopDir: string, artifacts: PlannerArtifacts): void {
   if (artifacts.plan) {
-    writeFileSync(join(loopDir, "plan.md"), artifacts.plan.trim() + "\n", "utf-8")
+    writeFileSync(join(loopDir, "plan.md"), sanitizePlannerArtifactText(artifacts.plan).trim() + "\n", "utf-8")
   }
-  writeFileSync(join(loopDir, "todo.md"), normalizeTodoArtifact(artifacts.todo).trim() + "\n", "utf-8")
+  writeFileSync(join(loopDir, "todo.md"), normalizeTodoArtifact(sanitizePlannerArtifactText(artifacts.todo)).trim() + "\n", "utf-8")
   writeFileSync(
     join(loopDir, "goal-tracker.md"),
-    normalizeGoalTrackerArtifact(artifacts.goalTracker, "plan.md").trim() + "\n",
+    normalizeGoalTrackerArtifact(sanitizePlannerArtifactText(artifacts.goalTracker), "plan.md").trim() + "\n",
     "utf-8",
   )
   refreshGoalTrackerImmutableHash(loopDir)
@@ -1248,9 +1567,10 @@ export function recordReviewDecision(input: {
   reviewerBackend?: ReviewerBackend
   reviewerModel?: string | null
   forceContinue?: {
-    parseStatus: "patch_apply_failed"
+    parseStatus: "patch_apply_failed" | "build_gate_failed"
     reason: string
     feedback: string
+    verification?: RoundVerificationArtifact
   }
 }): ReviewDecision {
   const reviewPath = join(input.loopDir, `round-${roundName(input.round)}-review.md`)
@@ -1271,11 +1591,13 @@ export function recordReviewDecision(input: {
   state.last_review_marker = decision.marker
   state.last_review_path = reviewPath
   const implementationWorkerRound = state.phase === "implementation" || state.phase === "full_alignment"
+  if (implementationWorkerRound) {
+    markStateWorkerRoundAttempted(state, input.round)
+    markStateWorkerRoundCompleted(state, input.round)
+    markStateWorkerRoundReviewed(state, input.round)
+  }
 
   if (decision.marker === "complete") {
-    if (implementationWorkerRound) {
-      state.worker_round_count = (state.worker_round_count ?? 0) + 1
-    }
     if (state.phase === "finalize") {
       state.phase = "complete"
       state.status = "complete"
@@ -1286,14 +1608,14 @@ export function recordReviewDecision(input: {
       )
     } else if (implementationWorkerRound) {
       state.phase = "review"
-      state.current_round = input.round + 1
+      setNextRoundCursor(state, input.round + 1)
       advanceRoundSession(state)
       feedbackPath = join(input.loopDir, `round-${roundName(input.round)}-feedback.md`)
       writeFileSync(feedbackPath, reviewPhaseFeedbackText(input.round), "utf-8")
       state.last_feedback_path = feedbackPath
     } else {
       state.phase = "finalize"
-      state.current_round = input.round + 1
+      setNextRoundCursor(state, input.round + 1)
       advanceRoundSession(state)
       feedbackPath = join(input.loopDir, `round-${roundName(input.round)}-feedback.md`)
       writeFileSync(feedbackPath, finalizeFeedbackText(input.round), "utf-8")
@@ -1309,12 +1631,10 @@ export function recordReviewDecision(input: {
     if (state.phase === "full_alignment" || state.phase === "review") {
       state.phase = "implementation"
     }
-    if (implementationWorkerRound) {
-      state.worker_round_count = (state.worker_round_count ?? 0) + 1
-    }
-    state.current_round = input.round + 1
+    setNextRoundCursor(state, input.round + 1)
     advanceRoundSession(state)
-    if (implementationWorkerRound && (state.worker_round_count ?? 0) >= state.max_rounds) {
+    const reviewedWorkerRounds = state.reviewed_worker_rounds ?? state.completed_worker_rounds ?? state.worker_round_count ?? 0
+    if (implementationWorkerRound && reviewedWorkerRounds >= state.max_rounds) {
       state.phase = "stopped"
       state.status = "stopped"
       writeFileSync(join(input.loopDir, "stop-state.md"), `PACT stopped after max round ${input.round}.\n`, "utf-8")
@@ -1333,6 +1653,14 @@ export function recordReviewDecision(input: {
       terminal_line: decision.terminalLine,
       review_path: reviewPath,
       feedback_path: feedbackPath,
+      raw_marker: forcedContinue ? parsedDecision.marker : undefined,
+      accepted: forcedContinue ? false : decision.marker === "complete",
+      blocked_by: forcedContinue
+        ? forcedContinue.parseStatus === "build_gate_failed"
+          ? "build_gate"
+          : "patch_apply"
+        : undefined,
+      verification_ref: forcedContinue?.verification ? artifactPaths(input.loopDir, input.round).verification : undefined,
       reviewer_backend: input.reviewerBackend,
       reviewer_model: input.reviewerModel,
       resulting_status: state.status,
@@ -1407,6 +1735,10 @@ The loop was stopped so artifacts can be inspected and replayed.
   }
   state.status = "stopped"
   state.phase = "stopped"
+  markStateWorkerRoundAttempted(state, input.round)
+  markStateWorkerRoundCompleted(state, input.round)
+  markStateWorkerRoundReviewed(state, input.round)
+  setNextRoundCursor(state, input.round + 1)
   state.last_review_marker = "continue"
   state.last_review_path = reviewPath
   state.last_feedback_path = feedbackPath
@@ -1438,9 +1770,18 @@ export function isProtectedWrite(filePath: string): boolean {
   const normalized = filePath.replaceAll("\\", "/")
   return (
     /\.pact\/loops\/[^/]+\/state\.json$/.test(normalized) ||
+    /\.pact\/loops\/[^/]+\/loop-manifest\.json$/.test(normalized) ||
+    /\.pact\/loops\/[^/]+\/source-plan\.md$/.test(normalized) ||
+    /\.pact\/loops\/[^/]+\/plan\.md$/.test(normalized) ||
+    /\.pact\/loops\/[^/]+\/todo\.md$/.test(normalized) ||
     /\.pact\/loops\/[^/]+\/goal-tracker\.md$/.test(normalized) ||
+    /\.pact\/loops\/[^/]+\/round-\d+-(?:state|context|patch-artifact|verification|continuation-package|review-decision|result|replay-case)\.json$/.test(
+      normalized,
+    ) ||
+    /\.pact\/loops\/[^/]+\/round-\d+-(?:events|workspace|eval|test)\.(?:jsonl|patch)$/.test(normalized) ||
     /\.pact\/loops\/[^/]+\/round-\d+-review\.md$/.test(normalized) ||
     /\.pact\/loops\/[^/]+\/round-\d+-feedback\.md$/.test(normalized) ||
+    /\.pact\/loops\/[^/]+\/round-\d+-evidence\.md$/.test(normalized) ||
     /\.pact\/loops\/[^/]+\/complete-state\.md$/.test(normalized) ||
     /\.pact\/loops\/[^/]+\/stop-state\.md$/.test(normalized)
   )
@@ -1475,6 +1816,9 @@ ${input.planContent}
 - Create a task breakdown table where every task maps to a target AC.
 - Use task tags: coding or analyze.
 - Do not include raw transcript content.
+- PACT/harness owns final patch export. The worker edits the workspace only.
+- Do not create acceptance criteria or tasks that ask the worker to generate, edit, stage, or inspect solution.patch or test.patch.
+- If the input plan mentions solution.patch/test.patch, translate it into workspace-edit boundaries and harness-export validation.
 
 Return exactly three marker blocks:
 
@@ -1549,21 +1893,36 @@ export function buildInitialWorkerPrompt(input: {
 }): string {
   return `# PACT Round ${roundName(input.round)}
 
-You are the PACT worker. Execute the next smallest coherent task from the ledger.
+You are the PACT worker. This is one bounded run.
 
 Read:
+- Plan: ${join(input.loopDir, "plan.md")}
 - Todo: ${input.todoPath}
 - Goal tracker: ${input.goalTrackerPath}
+
+First action: write ${join(input.loopDir, `round-${roundName(input.round)}-contract.md`)} with:
+- single mainline objective
+- target ACs
+- blocking issues
+- queued out-of-scope issues
+- success criteria
+
+Do not edit source files, run tests, or inspect unrelated files before this contract exists. Missing contract is a reviewer-blocking defect.
 
 Rules:
 - Preserve the immutable goal and acceptance criteria.
 - Make the smallest code changes that satisfy the active task.
 - Do not use Task/subagent delegation; do the work in this session so PACT can observe and replay the round.
+- Do not create or edit external validation-owned patch files; PACT owns patch export.
+- Do not run external validation gates or validation-owned commands; PACT runs verification after the round.
+- Do not stage, reset, commit, stash, or otherwise manage git index state.
+- Do not directly edit todo.md, plan.md, source-plan.md, review artifacts, result artifacts, state artifacts, or replay artifacts.
 - Do not directly edit the immutable section of goal-tracker.md.
-- If goal tracker updates are needed after Round 01, include a "Goal Tracker Update Request" section in your summary.
+- If goal tracker or todo ledger updates are needed, include a "Goal Tracker / Ledger Update Request" section in your summary.
 - Before stopping, write an honest summary to ${join(input.loopDir, `round-${roundName(input.round)}-summary.md`)}.
+- After writing the summary, stop work and return control to PACT. Do not keep coding, testing, or editing after the summary is written.
 
-The reviewer will inspect your summary and the repository state when this session goes idle.
+The reviewer will inspect your summary and the repository state when this bounded run ends.
 `
 }
 
@@ -1576,30 +1935,50 @@ export function buildContinuationPrompt(input: {
   planPath?: string
   preSnapshotPath?: string
   cumulativePatchPath?: string
+  continuationPackagePath?: string
+  continuationPackageText?: string
 }): string {
+  const packageText =
+    input.continuationPackageText ??
+    (input.continuationPackagePath && existsSync(input.continuationPackagePath)
+      ? readFileSync(input.continuationPackagePath, "utf-8")
+      : undefined)
   return `# PACT Round ${roundName(input.round)} Continuation
 
 The previous round did not pass review.
 
 This prompt is self-contained for a fresh worker session. Do not rely on prior chat context.
 
+${packageText ? `## Current Round Package Summary\n${packageText.trim()}\n` : ""}
+
 Read this round package:
 - Plan: ${input.planPath ?? join(input.loopDir, "plan.md")}
 - Todo: ${input.todoPath ?? join(input.loopDir, "todo.md")}
 - Goal tracker: ${input.goalTrackerPath}
-- Reviewer feedback: ${input.feedbackPath}
+- Continuation package: ${input.continuationPackagePath ?? artifactPaths(input.loopDir, Math.max(1, input.round - 1)).continuationPackage}
 - Pre-round snapshot: ${input.preSnapshotPath ?? artifactPaths(input.loopDir, input.round).preSnapshot}
-- Cumulative eval patch: ${
-    input.cumulativePatchPath ?? artifactPaths(input.loopDir, Math.max(1, input.round - 1)).evalPatch
-  }
 
-Address the feedback with the smallest necessary changes. Before stopping, write an honest summary to ${join(
+Address the worker-safe continuation package with the smallest necessary source changes. Before stopping, write an honest summary to ${join(
     input.loopDir,
     `round-${roundName(input.round)}-summary.md`,
   )}.
 
+First action: write ${join(input.loopDir, `round-${roundName(input.round)}-contract.md`)} with:
+- single mainline objective
+- target ACs
+- blocking issues
+- queued out-of-scope issues
+- success criteria
+
+Do not edit source files, run tests, or inspect unrelated files before this contract exists. Missing contract is a reviewer-blocking defect.
+
 Do not use Task/subagent delegation; do the work in this session so PACT can observe and replay the round.
-If goal tracker updates are needed, request them in your summary instead of editing immutable content directly.
+Do not create or edit external validation-owned patch files; PACT owns patch export.
+Do not run external validation gates or validation-owned commands; PACT runs verification after the round.
+Do not stage, reset, commit, stash, or otherwise manage git index state.
+Do not directly edit todo.md, plan.md, source-plan.md, review artifacts, result artifacts, state artifacts, or replay artifacts.
+If goal tracker or todo ledger updates are needed, include a "Goal Tracker / Ledger Update Request" section in your summary instead of editing ledgers directly.
+After writing the summary, stop work and return control to PACT. Do not keep coding, testing, or editing after the summary is written.
 `
 }
 
@@ -1611,11 +1990,19 @@ export function buildReviewPrompt(input: {
   goalTrackerPath?: string
   evalPatchPath?: string
   patchArtifactPath?: string
+  verificationPath?: string
   summaryPath: string
   summary: string
+  summaryStatus?: "present" | "missing"
+  contractPath?: string
+  contract?: string
+  contractStatus?: "present" | "missing"
   reviewKind?: "implementation" | "full_alignment" | "review"
 }): string {
   const kind = input.reviewKind ?? "implementation"
+  const summaryStatus = input.summaryStatus ?? (input.summary.trim() ? "present" : "missing")
+  const contractPath = input.contractPath ?? join(input.loopDir, `round-${roundName(input.round)}-contract.md`)
+  const contractStatus = input.contractStatus ?? (input.contract?.trim() ? "present" : "missing")
   const fullAlignmentSection =
     kind === "full_alignment"
       ? `
@@ -1643,22 +2030,34 @@ Focus on correctness, regressions, missing tests, and benchmark-facing patch qua
 
 You are the independent PACT reviewer.
 
-Review inputs:
+## Authoritative Facts
 - Plan: ${input.planPath ?? join(input.loopDir, "plan.md")}
 - Todo: ${input.todoPath ?? join(input.loopDir, "todo.md")}
 - Goal tracker: ${input.goalTrackerPath ?? join(input.loopDir, "goal-tracker.md")}
-- Round summary: ${input.summaryPath}
 - Eval patch: ${input.evalPatchPath ?? artifactPaths(input.loopDir, input.round).evalPatch}
 - Patch metadata: ${input.patchArtifactPath ?? artifactPaths(input.loopDir, input.round).patchArtifact}
+- Public round verification: ${input.verificationPath ?? artifactPaths(input.loopDir, input.round).verification}
+
+Treat the patch, changed files, goal tracker, and public verification artifact as facts. Hidden/final eval is not available during worker rounds and must not be inferred or copied into Next Worker Instructions.
+
+## Worker Claims
+- Round summary: ${input.summaryPath}
+- Summary status: ${summaryStatus}
+- Round contract: ${contractPath}
+- Contract status: ${contractStatus}
 
 Scope:
 - Stay within the plan, todo, goal tracker, summary, eval patch, and changed files listed in patch metadata.
 - Do not browse unrelated repository areas unless one of those inputs directly points you there.
 - Keep output short and structured.
-- This is the only reviewer pass for this worker round: include code-review checks for correctness, regressions, missing tests, hidden benchmark risks, patch separation, and artifact quality.
+- This is the only reviewer pass for this worker round: include code-review checks for correctness, regressions, missing public/self tests, patch separation, and artifact quality.
+- Public verification is authoritative when present for patch apply/build/public-check failures. Do not write PACT_COMPLETE if public verification reports failed/timeout/infra_failed or a failed build_status. The driver runs final hidden scoring only after your candidate PACT_COMPLETE.
 
 ## Round Summary
-${input.summary}
+${summaryStatus === "present" ? input.summary : "(missing)"}
+
+## Round Contract
+${contractStatus === "present" ? input.contract : "(missing)"}
 
 ${fullAlignmentSection}${reviewPhaseSection}
 
@@ -1671,11 +2070,29 @@ State whether this checkpoint is complete or needs another worker round.
 ### Goal Alignment Summary
 Use this compact line: ACs: X/Y addressed | Forgotten items: N | Unjustified deferrals: N
 
+### Public Verification Gate
+State public verification status/build_status if present, and whether this checkpoint is allowed to become a candidate for final hidden scoring.
+
+### Claim Audit
+Audit the worker summary as claims, not facts. Identify unsupported claims, missing summary, and mismatches against patch/verification.
+
+### Contract Scope Audit
+Audit the round contract as a worker claim. State whether it is too broad, too narrow, avoids required ACs, or correctly focuses the mainline.
+
 ### Acceptance Criteria Audit
 Audit each AC from the goal tracker as MET, PARTIAL, NOT MET, or DEFERRED with evidence.
 
 ### Findings
 List concrete issues. If none, write "(none)".
+
+### Mainline Gaps
+List unfinished mainline requirements based on authoritative facts.
+
+### Blocking Side Issues
+List side issues that block acceptance criteria or build/eval safety.
+
+### Queued Side Issues
+List non-blocking side issues that should be queued, not allowed to distract the next worker round.
 
 ### Goal Tracker Updates
 If the worker summary includes a Goal Tracker Update Request, approve or reject it here.
@@ -1736,10 +2153,17 @@ export function resolveProjectPath(projectRoot: string, filePath: string): strin
 }
 
 export function normalizePlanLedger(input: { planPath: string; planContent: string }): PlannerArtifacts {
-  const goal = extractFirstUsefulPlanLine(input.planContent) ?? `Execute the plan: ${input.planPath}`
+  const goal = sanitizePlannerArtifactText(
+    extractFirstUsefulPlanLine(input.planContent) ?? `Execute the plan: ${input.planPath}`,
+  )
   const acRows = extractAcceptanceCriteria(input.planContent)
   const criteria = acRows.length
-    ? acRows
+    ? acRows.map((criterion) => ({
+        ...criterion,
+        text: sanitizePlannerArtifactText(criterion.text),
+        positive: sanitizePlannerArtifactText(criterion.positive),
+        negative: sanitizePlannerArtifactText(criterion.negative),
+      }))
     : [
         {
           id: "AC-1",
@@ -1748,7 +2172,10 @@ export function normalizePlanLedger(input: { planPath: string; planContent: stri
           negative: "Incomplete or unrelated changes are rejected.",
         },
       ]
-  const taskRows = extractTaskRows(input.planContent, criteria)
+  const taskRows = extractTaskRows(input.planContent, criteria).map((task) => ({
+    ...task,
+    description: sanitizeTaskDescription(task.description),
+  }))
   return {
     todo: renderTodo(taskRows),
     goalTracker: renderGoalTracker({
@@ -1757,6 +2184,43 @@ export function normalizePlanLedger(input: { planPath: string; planContent: stri
       tasks: taskRows,
     }),
   }
+}
+
+function sanitizePlannerArtifactText(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .map((line) => {
+      const sanitizedLine = sanitizePatchArtifactNames(line)
+      if (!isWorkerOwnedPatchTask(line)) return sanitizedLine
+      if (!line.trim().startsWith("|")) return "Keep implementation and optional test changes separable for PACT/harness patch export."
+      const cells = line.split("|")
+      return cells
+        .map((cell, index) =>
+          index > 0 && isWorkerOwnedPatchTask(cell)
+            ? " Keep implementation and optional test changes separable for PACT/harness patch export "
+            : sanitizePatchArtifactNames(cell),
+        )
+        .join("|")
+    })
+    .join("\n")
+}
+
+function sanitizeTaskDescription(description: string): string {
+  if (isWorkerOwnedPatchTask(description)) {
+    return "Keep implementation and optional test changes separable for PACT/harness patch export."
+  }
+  return sanitizePatchArtifactNames(description)
+}
+
+function sanitizePatchArtifactNames(text: string): string {
+  return text
+    .replace(/`?solution\.patch`?/gi, "PACT/harness-owned implementation patch artifact")
+    .replace(/`?test\.patch`?/gi, "PACT/harness-owned optional-test patch artifact")
+}
+
+function isWorkerOwnedPatchTask(text: string): boolean {
+  if (!/\b(?:solution|test)\.patch\b/i.test(text)) return false
+  return /\b(?:generate|create|write|edit|stage|inspect|export|produce)\b/i.test(text)
 }
 
 export function goalTrackerImmutableSha256(text: string): string {
@@ -2130,6 +2594,112 @@ function compactOneLine(text: string): string {
   return text.replace(/\s+/g, " ").trim().slice(0, 500)
 }
 
+function tailLines(text: string, maxLines: number): string {
+  const lines = text.split(/\r?\n/)
+  return lines.slice(Math.max(0, lines.length - maxLines)).join("\n").trim()
+}
+
+function firstUsefulLine(text: string): string | undefined {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0)
+    ?.slice(0, 500)
+}
+
+function extractNextWorkerInstruction(text: string): string | undefined {
+  const match = /### Next Worker Instructions?\s*([\s\S]*?)(?:\n### |\nPACT_COMPLETE\s*$|$)/i.exec(text)
+  if (!match) return undefined
+  const body = (match[1] ?? "").trim()
+  const terminal = lastNonEmptyLine(body)
+  const clean =
+    terminal === "PACT_COMPLETE" || terminal === "PACT_STOP" || terminal === "PACT_CONTINUE"
+      ? stripFinalNonEmptyLine(body)
+      : body
+  return compactOneLine(clean)
+}
+
+function workerSafeNextInstruction(
+  instruction: string | undefined,
+  input: { verification?: RoundVerificationArtifact; changedFiles: string[] },
+): string | undefined {
+  const text = sanitizeWorkerFacingInstruction(compactOneLine(instruction ?? ""))
+  if (!text && input.verification?.status && input.verification.status !== "passed") {
+    return "Use the worker-safe continuation package and changed files to make workspace-only source changes, then write the round summary."
+  }
+  if (!text) return undefined
+  if (!mentionsHarnessOwnedWork(instruction ?? "")) return text
+
+  const paths = input.changedFiles.filter((filePath) => /(?:^|\/)(?:test|Lib\/test)\b/i.test(filePath)).slice(0, 4)
+  const pathText = paths.length ? ` Changed test-like paths to inspect cautiously: ${paths.join(", ")}.` : ""
+  return compactOneLine(
+    `Use the worker-safe continuation package and changed files to make workspace-only source changes.${pathText} Then write the round summary.`,
+  )
+}
+
+function workerSafeFailureSignature(signature: string | undefined): string | undefined {
+  const text = sanitizeWorkerFacingInstruction(compactOneLine(signature ?? ""))
+  if (!text || text === "[redacted worker-unsafe benchmark/eval detail]") return undefined
+  if (!/[A-Za-z0-9]/.test(text)) return undefined
+  if (/^[{}\[\](),.;:\s-]+$/.test(text)) return undefined
+  return text
+}
+
+function sanitizeWorkerFacingInstruction(text: string): string {
+  const safe = redactText(text)
+    .replace(/\bForwardRef\s*\([^)]*\)/g, "future-annotations behavior")
+    .replace(/\b(?:F2P|P2P)\b/gi, "source validation")
+    .replace(/\b(?:test|unittest)(?:\.[A-Za-z_][\w]*)*\.test_[A-Za-z_][\w]*\b/gi, "redacted test case")
+    .replace(/\b[A-Za-z_][\w]*\.[A-Za-z_][\w]*\.test_[A-Za-z_][\w]*\b/g, "redacted test case")
+    .replace(/\bfocused evaluation\b/gi, "focused source/public checks")
+    .replace(/\beval failure\b/gi, "validation failure")
+  return sanitizeWorkerFacingText(safe)
+}
+
+function mentionsHarnessOwnedWork(text: string): boolean {
+  return /\b(?:PACT\s+)?patch artifacts?\b/i.test(text) ||
+    /\b(?:re)?run\b[\s\S]*\b(?:PACT\s+)?gate\b/i.test(text) ||
+    /\b(?:PACT\s+)?gate\b[\s\S]*\b(?:re)?run\b/i.test(text) ||
+    /\beval patch\b[\s\S]*\bincremental delta\b/i.test(text) ||
+    /\beval failure\b/i.test(text) ||
+    /\b(?:workspace_patch|eval_patch|patch-artifact|solution\.patch|test\.patch|lolbench_eval\.py)\b/i.test(text)
+}
+
+function compactReviewFindings(text: string): string {
+  const findings = /### Findings\s*([\s\S]*?)(?:\n### |\nPACT_COMPLETE\s*$|$)/i.exec(text)?.[1]
+  return sanitizeWorkerFacingText(findings ?? text).slice(0, 2000)
+}
+
+export function sanitizeWorkerFacingText(text: string): string {
+  const redactedLine = "[redacted worker-unsafe benchmark/eval detail]"
+  const lines = redactText(text)
+    .split(/\r?\n/)
+    .map((line) => (isWorkerUnsafeLine(line) ? redactedLine : line))
+  return lines
+    .join("\n")
+    .replace(new RegExp(`(?:${escapeRegExp(redactedLine)}\\n?){2,}`, "g"), `${redactedLine}\n`)
+    .trim()
+}
+
+function isWorkerUnsafeLine(line: string): boolean {
+  return (
+    /\b(?:eval_tests\.patch|F2P|P2P|hidden[/-]?eval|final-hidden-gate|Docker grade|lolbench_eval\.py|pact-gate|LOLBENCH_|TestRecord\.java:\d+|Latest Verification Log Tail|eval failure)\b/i.test(
+      line,
+    ) ||
+    /\b(?:test|unittest)(?:\.[A-Za-z_][\w]*)*\.test_[A-Za-z_][\w]*\b/i.test(line) ||
+    /\b[A-Za-z_][\w]*\.[A-Za-z_][\w]*\.test_[A-Za-z_][\w]*\b/.test(line) ||
+    /\bverification\s+(?:shows?|reports?|reveals?|indicates?|says?|found|failed|error)\b/i.test(line) ||
+    /\b(?:unparses|round-?trips?)\s+as\b/i.test(line) ||
+    /\bForwardRef\s*\(/.test(line) ||
+    /\bround-\d+-verification\.(?:json|log)\b/i.test(line) ||
+    /\bverification\.(?:json|log)\b/i.test(line) ||
+    /\bverification (?:artifact|log)\b/i.test(line) ||
+    /\bharness\b/i.test(line) ||
+    /\bpatch export\b/i.test(line) ||
+    /\beval patch\b/i.test(line)
+  )
+}
+
 function safeErrorSummary(error: unknown): string {
   const text =
     error instanceof Error
@@ -2194,7 +2764,12 @@ function defaultRoundArtifacts(loopDir: string, round: number): Record<string, s
     evidence_markdown: paths.evidenceMarkdown,
     workspace_patch: paths.workspacePatch,
     eval_patch: paths.evalPatch,
+    test_patch: paths.testPatch,
     patch_artifact: paths.patchArtifact,
+    verification: paths.verification,
+    verification_log: paths.verificationLog,
+    continuation_package: paths.continuationPackage,
+    continuation_package_json: paths.continuationPackageJson,
     review_decision: paths.reviewDecision,
     round_result: paths.roundResult,
     round_replay_case: paths.roundReplayCase,
@@ -2242,10 +2817,36 @@ function addSafePatchPath(paths: Set<string>, filePath: string | undefined): voi
   paths.add(normalized)
 }
 
+function collectTestPatchPaths(projectRoot: string, excludes: string[]): string[] {
+  return Array.from(new Set([...collectRootTestPatchPaths(projectRoot), ...collectChangedProjectTestPaths(projectRoot, excludes)])).sort()
+}
+
 function collectRootTestPatchPaths(projectRoot: string): string[] {
   const testPatchPath = join(projectRoot, "test.patch")
   if (!existsSync(testPatchPath)) return []
   return extractPatchChangedPaths(readFileSync(testPatchPath, "utf-8"))
+}
+
+function collectChangedProjectTestPaths(projectRoot: string, excludes: string[]): string[] {
+  const changedFiles = [
+    ...gitStdout(projectRoot, ["diff", "--name-only", "HEAD", "--", ".", ...excludes])
+      .split(/\r?\n/)
+      .filter(Boolean),
+    ...gitStdout(projectRoot, ["ls-files", "--others", "--exclude-standard", "-z", "--", ".", ...excludes])
+      .split("\0")
+      .filter(Boolean),
+  ]
+  return Array.from(new Set(changedFiles.filter(isConventionalProjectTestPath))).sort()
+}
+
+function isConventionalProjectTestPath(filePath: string): boolean {
+  const normalized = filePath.replaceAll("\\", "/")
+  return (
+    /^Lib\/test\//.test(normalized) ||
+    /(^|\/)(?:test|tests|__tests__)\/.+/.test(normalized) ||
+    /(^|\/)test_[^/]+$/.test(normalized) ||
+    /(^|\/)[^/]+(?:_test|\.test)\.[^/]+$/.test(normalized)
+  )
 }
 
 function collectExcludedScaffoldingFiles(projectRoot: string): ExcludedScaffoldingFile[] {
@@ -2299,6 +2900,28 @@ function captureGitPatch(projectRoot: string, excludes: string[]): { patchText: 
   const patchText = joinPatchParts([trackedPatch, untrackedPatch])
   const changedFiles = [
     ...gitStdout(projectRoot, ["diff", "--name-only", "HEAD", "--", ".", ...excludes])
+      .split(/\r?\n/)
+      .filter(Boolean),
+    ...untrackedFiles,
+  ].sort()
+  return { patchText, changedFiles }
+}
+
+function captureGitPatchForPaths(projectRoot: string, filePaths: string[]): { patchText: string; changedFiles: string[] } {
+  const paths = Array.from(new Set(filePaths.filter((filePath) => filePath && !filePath.startsWith("/")))).sort()
+  if (!paths.length) return { patchText: "", changedFiles: [] }
+  const trackedPatch = gitStdout(projectRoot, ["diff", "--binary", "HEAD", "--", ...paths])
+  const untrackedFiles = gitStdout(projectRoot, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...paths])
+    .split("\0")
+    .filter(Boolean)
+    .sort()
+  const untrackedPatch = untrackedFiles
+    .map((file) => gitDiffNoIndex(projectRoot, file))
+    .filter(Boolean)
+    .join("")
+  const patchText = joinPatchParts([trackedPatch, untrackedPatch])
+  const changedFiles = [
+    ...gitStdout(projectRoot, ["diff", "--name-only", "HEAD", "--", ...paths])
       .split(/\r?\n/)
       .filter(Boolean),
     ...untrackedFiles,

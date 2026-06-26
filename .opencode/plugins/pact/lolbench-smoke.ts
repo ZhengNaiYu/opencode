@@ -88,6 +88,9 @@ export function buildZaiCodingPlanConfigPatch(): Record<string, unknown> {
           apiKey: "{env:ZAI_API_KEY}",
         },
         models: {
+          "glm-5.1": {
+            name: "GLM 5.1",
+          },
           "glm-5-turbo": {
             name: "GLM 5 Turbo",
           },

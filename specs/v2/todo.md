@@ -2,6 +2,69 @@
 
 ok we need to work towards a launch of v2 so we can get out of this rebuild phase
 
+## PACT container-worker mode - James
+
+First stabilize the host-side driver-owned round lifecycle with a one-case
+LoLBench smoke using `zai-coding-plan/glm-5-turbo`. After that, implement a
+container-worker mode where the PACT driver stays on the host, but each worker
+round runs `opencode run` inside the eval-derived container.
+
+Key constraints:
+
+- host driver owns round boundaries, review, reporting, and artifact collection
+- container workspace and `.pact/` should be bind-mounted so artifacts are
+  host-visible immediately, even when a worker process times out or fails
+- the container image/runtime must provide `opencode`, `bun`, the PACT plugin
+  bundle, and ZAI env access without exposing LoLBench private/eval artifacts
+  to the worker
+- reviewer and final human/report artifacts can remain host-side initially
+- use the verified host flow as the behavioral contract before adding Docker
+  transport
+
+Host smoke findings to preserve in the container-worker design:
+
+- the host driver-owned chain is valid: Round00 planner -> worker run-exit ->
+  patch/test/eval split -> verification -> Codex review -> continuation prompt
+- `.pact` artifact reads must stay allowlisted; broad `.pact` directory reads
+  and globs should remain blocked in strict benchmark mode
+- continuation must stay worker-safe but still preserve source-level guidance;
+  raw gate logs, F2P/P2P, eval test names, and harness paths must not feed the
+  next worker
+- worker contract is currently prompt-enforced; missing contracts must remain a
+  reviewer-blocking defect, and future hard enforcement can require the first
+  worker mutation to be `round-XX-contract.md`
+- worker prompts must explicitly tell the worker to stop after writing
+  `round-XX-summary.md`; driver-owned boundaries still use process exit
+
+Container-worker implementation sketch:
+
+- [x] extend LoLBench host mode to build or expose a private-stripped agent image
+  (`LOLBENCH_AGENT_IMAGE_TAG`) using the existing `build_agent_image(...)`
+  helper, then pass it to the PACT driver env
+- [x] extend `pact-run-driver.ts` with `worker_runner=host|docker`; `docker` wraps
+  each worker `opencode run` in `docker run`
+- [x] bind-mount the host seeded workspace read-write into the container so source
+  edits and `.pact/` artifacts land on the host immediately
+- [x] mount the PACT plugin bundle read-only at a stable container path and rewrite
+  worker-side `OPENCODE_CONFIG_CONTENT` so OpenCode loads the mounted plugin
+- [x] pass only worker-safe env vars into the container (`ZAI_API_KEY`,
+  `ZAI_API_BASE`, model/provider config, PACT round env); keep Codex reviewer
+  auth host-side
+- [x] run reviewer, final report generation, artifact archiving, and authoritative
+  gate on the host after the container worker process exits
+
+Current v1 usage:
+
+- LoLBench host path can be run with `--pact-container-worker`; this still seeds
+  and captures patches on the host, but sets `PACT_WORKER_RUNNER=docker` and
+  `LOLBENCH_AGENT_IMAGE_TAG=<eval-derived-agent-image>` for the PACT driver.
+- PACT driver can also be called directly with `--worker-runner docker` or
+  `PACT_WORKER_RUNNER=docker`; it uses `LOLBENCH_AGENT_IMAGE_TAG` unless
+  `--worker-container-image` is explicit.
+- Docker worker runs inherit `LOLBENCH_MEM` / `LOLBENCH_CPUS`, bind-mount the
+  workspace, mount the PACT plugin read-only, rewrite `OPENCODE_CONFIG_CONTENT`,
+  and keep reviewer/Codex calls on the host.
+
 ## Post-Hono cleanup - Kit
 
 The opencode server has moved to the Effect HttpApi backend. Remaining work is

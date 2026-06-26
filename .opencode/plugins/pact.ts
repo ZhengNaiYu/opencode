@@ -21,6 +21,7 @@ import {
   createLoop,
   exportReplayCase,
   findActiveLoop,
+  artifactPaths,
   isProtectedWrite,
   parsePlannerArtifacts,
   readState,
@@ -39,6 +40,8 @@ import {
   writeRoundSnapshot,
   writeRoundState,
   writeRoundTrajectory,
+  writeContinuationPackage,
+  writeVerificationArtifact,
   writeState,
   type FailureClassificationInput,
   type LoopPhase,
@@ -47,8 +50,10 @@ import {
   type PatchArtifact,
   type PlannerBackend,
   type PlannerValidationResult,
+  type RoundVerificationArtifact,
   type ReviewerBackend,
   type ReviewMarker,
+  type RoundBoundary,
   type SessionStrategy,
   type TrajectoryMode,
   type WorkerBackend,
@@ -67,6 +72,7 @@ export type PactPluginOptions = {
   workerModel?: string
   workerConfigSource?: string
   sessionStrategy?: SessionStrategy
+  roundBoundary?: RoundBoundary
   trajectoryMode?: TrajectoryMode
   codexCommand?: string
   codexArgs?: string[]
@@ -74,6 +80,8 @@ export type PactPluginOptions = {
   codexTimeoutMs?: number
   fullAlignmentInterval?: number
   benchmarkStrictNetwork?: boolean
+  verificationCommand?: string
+  verificationTimeoutMs?: number
 }
 
 type PromptClient = {
@@ -95,9 +103,11 @@ export const PACT_PLUGIN_DEFAULTS = {
   workerModel: "zai-coding-plan/glm-5-turbo",
   workerConfigSource: "mini-swe-agent-env",
   codexTimeoutMs: 10 * 60 * 1000,
+  verificationTimeoutMs: 30 * 60 * 1000,
   maxRounds: 8,
   fullAlignmentInterval: 5,
   sessionStrategy: "new-per-round" as SessionStrategy,
+  roundBoundary: "session_idle" as RoundBoundary,
   trajectoryMode: "full-redact" as TrajectoryMode,
 }
 
@@ -122,8 +132,11 @@ export const PactPlugin: Plugin = async ({ client, directory, worktree }, option
           worker_model: tool.schema.string().optional(),
           worker_config_source: tool.schema.string().optional(),
           session_strategy: tool.schema.enum(["new-per-round", "same-session"]).optional(),
+          round_boundary: tool.schema.enum(["session_idle", "run_exit"]).optional(),
           trajectory_mode: tool.schema.enum(["structured", "full-redact"]).optional(),
           full_alignment_interval: tool.schema.number().optional(),
+          verification_command: tool.schema.string().optional(),
+          verification_timeout_ms: tool.schema.number().optional(),
         },
         async execute(args, context) {
           const plannerBackend = args.planner_backend ?? cfg.plannerBackend
@@ -137,7 +150,10 @@ export const PactPlugin: Plugin = async ({ client, directory, worktree }, option
           const workerConfigSource =
             args.worker_config_source ?? cfg.workerConfigSource ?? PACT_PLUGIN_DEFAULTS.workerConfigSource
           const sessionStrategy = args.session_strategy ?? cfg.sessionStrategy ?? PACT_PLUGIN_DEFAULTS.sessionStrategy
+          const roundBoundary = args.round_boundary ?? cfg.roundBoundary ?? PACT_PLUGIN_DEFAULTS.roundBoundary
           const trajectoryMode = args.trajectory_mode ?? cfg.trajectoryMode ?? PACT_PLUGIN_DEFAULTS.trajectoryMode
+          const verificationCommand = args.verification_command ?? cfg.verificationCommand
+          const verificationTimeoutMs = args.verification_timeout_ms ?? cfg.verificationTimeoutMs
           const loop = createLoop({
             projectRoot: context.worktree || context.directory || projectRoot,
             planFile: args.plan_file,
@@ -151,8 +167,11 @@ export const PactPlugin: Plugin = async ({ client, directory, worktree }, option
             workerConfigSource,
             workerSessionID: context.sessionID,
             sessionStrategy,
+            roundBoundary,
             trajectoryMode,
             fullAlignmentInterval: args.full_alignment_interval ?? cfg.fullAlignmentInterval,
+            verificationCommand,
+            verificationTimeoutMs,
           })
           const planContent = readFileSync(join(loop.loopDir, "source-plan.md"), "utf-8")
 
@@ -377,6 +396,7 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
       if (!loop) return
 
       let state = readState(loop.loopDir)
+      if (state.round_boundary === "run_exit") return
       if (shouldBindIdleSession(loop.loopDir, state, sessionID)) {
         state = bindRoundSession(loop.loopDir, sessionID)
       }
@@ -388,6 +408,7 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
         await handleFinalizeIdle({
           client: promptClient,
           cfg,
+          projectRoot,
           loopDir: loop.loopDir,
           state,
           round,
@@ -457,6 +478,7 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
           writeState(loop.loopDir, workingState)
         }
         let patchArtifact: PatchArtifact
+        let verification: RoundVerificationArtifact | undefined
         try {
           patchArtifact = capturePatchArtifact({
             projectRoot,
@@ -492,6 +514,36 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
             round,
             stage: "post",
           })
+          const verificationState = readState(loop.loopDir)
+          verification = runVerificationCommand({
+            cfg: verificationConfigForState(verificationState, cfg),
+            projectRoot,
+            loopDir: loop.loopDir,
+            round,
+            patchArtifact,
+            source: "lightweight",
+          })
+          if (verification) {
+            workingState = readState(loop.loopDir)
+            workingState.last_verification_status = verification.status
+            workingState.last_verification_build_status = verification.build_status
+            if (verificationPassed(verification)) {
+              workingState.latest_build_success_round ??= round
+            }
+            writeState(loop.loopDir, workingState)
+            appendRoundEvent({
+              loopDir: loop.loopDir,
+              loopID: workingState.loop_id,
+              round,
+              type: "patch_captured",
+              sessionID: workingState.active_session_id,
+              data: {
+                verification_status: verification.status,
+                build_status: verification.build_status,
+                failure_signature: verification.failure_signature,
+              },
+            })
+          }
         } catch (err) {
           workingState.status = "stopped"
           workingState.phase = "stopped"
@@ -554,6 +606,7 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
           summary,
           evalPatchPath: patchArtifact.eval_patch.path,
           patchArtifactPath: join(loop.loopDir, `round-${roundName(round)}-patch-artifact.json`),
+          verificationPath: verification ? artifactPaths(loop.loopDir, round).verification : undefined,
           reviewKind,
         })
         writeFileSync(join(loop.loopDir, `round-${roundName(round)}-review-prompt.md`), reviewPrompt, "utf-8")
@@ -669,10 +722,36 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
                   reason: "patch_apply_check_failed",
                   feedback: `PACT patch apply check failed. Fix the patch before completion can be accepted.\n\n${patchArtifact.checks.apply_check.stderr ?? ""}`,
                 }
+              : verification && !verificationPassed(verification)
+                ? {
+                    parseStatus: "build_gate_failed",
+                    reason: "build_gate_failed",
+                    feedback: buildGateFeedback(verification),
+                    verification,
+                  }
               : undefined,
         })
 
         const nextState = readState(loop.loopDir)
+        if (nextState.status === "stopped" && verification && !verificationPassed(verification)) {
+          nextState.stop_reason = "max_rounds_without_build_success"
+          writeState(loop.loopDir, nextState)
+        }
+        if (decision.marker === "continue") {
+          writeContinuationPackage({
+            loopDir: loop.loopDir,
+            round,
+            nextRound: nextState.current_round,
+            maxRounds: nextState.max_rounds,
+            workerRoundCount: nextState.worker_round_count ?? 0,
+            loopPhase: nextState.phase,
+            reviewText,
+            verification,
+            changedFiles: patchArtifact.eval_patch.changed_files,
+            patchSha256: patchArtifact.eval_patch.sha256,
+            feedbackPath: nextState.last_feedback_path,
+          })
+        }
           writeRoundState({
             loopDir: loop.loopDir,
             loopID: nextState.loop_id,
@@ -704,7 +783,7 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
           round,
           status: nextState.status,
           loopPhase: nextState.phase,
-          failure: roundFailure(decision.marker, nextState.status, round, nextState.max_rounds, patchArtifact),
+          failure: roundFailure(decision.marker, nextState.status, round, nextState.max_rounds, patchArtifact, verification),
           reviewMarker: decision.marker,
           plannerBackend: nextState.planner_backend,
           plannerModel: plannerModelFromState(nextState, cfg),
@@ -750,6 +829,7 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
       const args = output?.args ?? {}
       const loop =
         claimRoundSessionFromExpectedWrite(projectRoot, input.sessionID, input.tool, args) ??
+        claimRoundSessionFromFirstWorkerEvent(projectRoot, input.sessionID) ??
         matchingActiveLoop(projectRoot, input.sessionID)
       if (loop) {
         const state = readState(loop.loopDir)
@@ -787,7 +867,7 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
         }
         throw new Error(`[PACT] blocked benchmark network access to ${networkBlock.host}`)
       }
-      const commandBlock = cfg.benchmarkStrictNetwork ? benchmarkCommandBlock(input.tool, args) : undefined
+      const commandBlock = cfg.benchmarkStrictNetwork ? benchmarkCommandBlock(projectRoot, input.tool, args) : undefined
       if (commandBlock) {
         if (loop) {
           const state = readState(loop.loopDir)
@@ -803,11 +883,20 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
               status: "blocked",
               reason: commandBlock.reason,
               tests: commandBlock.tests,
+              target: commandBlock.target,
             },
           })
         }
+        if (commandBlock.reason === "benchmark_strict_broad_cpython_tests") {
+          throw new Error(
+            "[PACT] blocked broad CPython test command; run focused, bounded tests only in benchmark mode.",
+          )
+        }
+        if (commandBlock.reason === "benchmark_strict_external_path") {
+          throw new Error("[PACT] blocked workspace-external file access in benchmark mode.")
+        }
         throw new Error(
-          "[PACT] blocked broad CPython test command; run focused, bounded tests only in benchmark mode.",
+          "[PACT] blocked benchmark-owned command; PACT owns patch export, git index state, and authoritative gates.",
         )
       }
       const pathBlock = cfg.benchmarkStrictNetwork ? benchmarkPathBlock(projectRoot, input.tool, args) : undefined
@@ -830,6 +919,29 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
           })
         }
         throw new Error("[PACT] blocked workspace-external file access in benchmark mode.")
+      }
+      const pactArtifactBlock = cfg.benchmarkStrictNetwork
+        ? benchmarkPactArtifactReadBlock(projectRoot, input.tool, args)
+        : undefined
+      if (pactArtifactBlock) {
+        if (loop) {
+          const state = readState(loop.loopDir)
+          appendRoundEvent({
+            loopDir: loop.loopDir,
+            loopID: state.loop_id,
+            round: state.current_round,
+            type: "tool_before",
+            sessionID: input.sessionID,
+            data: {
+              tool: input.tool,
+              call_id: input.callID,
+              status: "blocked",
+              reason: pactArtifactBlock.reason,
+              path: pactArtifactBlock.path,
+            },
+          })
+        }
+        throw new Error("[PACT] blocked reviewer-only PACT artifact; read only worker-safe PACT artifacts in benchmark mode.")
       }
       const toolBlock = cfg.benchmarkStrictNetwork ? benchmarkToolBlock(input.tool) : undefined
       if (toolBlock) {
@@ -858,6 +970,29 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
       if (!filePaths.length) return
       for (const filePath of filePaths) {
         const absolute = resolveProjectPath(projectRoot, filePath)
+        const scaffoldingBlock = cfg.benchmarkStrictNetwork
+          ? benchmarkScaffoldingPatchWriteBlock(projectRoot, absolute)
+          : undefined
+        if (scaffoldingBlock) {
+          if (loop) {
+            const state = readState(loop.loopDir)
+            appendRoundEvent({
+              loopDir: loop.loopDir,
+              loopID: state.loop_id,
+              round: state.current_round,
+              type: "tool_before",
+              sessionID: input.sessionID,
+              data: {
+                tool: input.tool,
+                call_id: input.callID,
+                status: "blocked",
+                reason: scaffoldingBlock.reason,
+                path: scaffoldingBlock.path,
+              },
+            })
+          }
+          throw new Error("[PACT] blocked benchmark-owned patch file; PACT owns patch export.")
+        }
         if (isProtectedWrite(absolute)) {
           throw new Error(`[PACT] Protected ledger file cannot be modified by the worker: ${filePath}`)
         }
@@ -1020,6 +1155,19 @@ function claimRoundSessionFromExpectedWrite(
   return nextState.active_round_session_id === sessionID ? loop : undefined
 }
 
+function claimRoundSessionFromFirstWorkerEvent(projectRoot: string, sessionID: string | undefined) {
+  if (!sessionID) return undefined
+  const loop = findActiveLoop(projectRoot)
+  if (!loop) return undefined
+  const state = readState(loop.loopDir)
+  if (state.session_strategy !== "new-per-round") return undefined
+  if (state.active_round_session_id || state.active_session_id) return undefined
+  const promptPath = join(loop.loopDir, `round-${roundName(state.current_round)}-prompt.md`)
+  if (!existsSync(promptPath)) return undefined
+  const nextState = bindRoundSession(loop.loopDir, sessionID)
+  return nextState.active_round_session_id === sessionID ? loop : undefined
+}
+
 function shouldBindIdleSession(loopDir: string, state: PactState, sessionID?: string): boolean {
   if (!sessionID) return false
   if (state.session_strategy !== "new-per-round") return true
@@ -1049,11 +1197,13 @@ async function maybePromptNextPhase(
       goalTrackerPath,
     })
   } else if (state.phase === "implementation") {
+    const continuationPackagePath = artifactPaths(loopDir, reviewedRound).continuationPackage
     prompt = buildContinuationPrompt({
       loopDir,
       round: state.current_round,
       feedbackPath,
       goalTrackerPath,
+      continuationPackagePath,
     })
   }
   if (!prompt) return
@@ -1097,6 +1247,7 @@ async function maybePromptNextPhase(
 async function handleFinalizeIdle(input: {
   client: PromptClient
   cfg: PactPluginOptions
+  projectRoot: string
   loopDir: string
   state: PactState
   round: number
@@ -1133,6 +1284,130 @@ async function handleFinalizeIdle(input: {
     return
   }
 
+  let finalizePatchArtifact: PatchArtifact | undefined
+  let finalizeVerification: RoundVerificationArtifact | undefined
+  const loopCfg = verificationConfigForState(input.state, input.cfg)
+  if (loopCfg.verificationCommand) {
+    finalizePatchArtifact = capturePatchArtifact({
+      projectRoot: input.projectRoot,
+      loopDir: input.loopDir,
+      round: input.round,
+    })
+    finalizeVerification = runVerificationCommand({
+      cfg: loopCfg,
+      projectRoot: input.projectRoot,
+      loopDir: input.loopDir,
+      round: input.round,
+      patchArtifact: finalizePatchArtifact,
+      source: "finalize",
+    })
+    if (finalizeVerification) {
+      input.state.last_verification_status = finalizeVerification.status
+      input.state.last_verification_build_status = finalizeVerification.build_status
+      if (verificationPassed(finalizeVerification)) {
+        input.state.latest_build_success_round ??= input.round
+      }
+      appendRoundEvent({
+        loopDir: input.loopDir,
+        loopID: input.state.loop_id,
+        round: input.round,
+        type: "patch_captured",
+        sessionID: input.state.active_round_session_id ?? input.state.active_session_id,
+        data: {
+          verification_status: finalizeVerification.status,
+          build_status: finalizeVerification.build_status,
+          failure_signature: finalizeVerification.failure_signature,
+        },
+      })
+    }
+    if (finalizeVerification && !verificationPassed(finalizeVerification)) {
+      const feedbackPath = join(input.loopDir, `round-${roundName(input.round)}-feedback.md`)
+      const feedback = buildGateFeedback(finalizeVerification)
+      writeFileSync(feedbackPath, feedback, "utf-8")
+      const exhausted = (input.state.worker_round_count ?? 0) >= input.state.max_rounds
+      input.state.previous_round_session_id = input.state.active_round_session_id ?? input.state.active_session_id
+      input.state.active_round_session_id = undefined
+      input.state.active_session_id = undefined
+      input.state.last_feedback_path = feedbackPath
+      input.state.status = exhausted ? "stopped" : "running"
+      input.state.phase = exhausted ? "stopped" : "implementation"
+      if (exhausted) {
+        input.state.stop_reason = "max_rounds_without_build_success"
+      } else {
+        input.state.current_round = input.round + 1
+      }
+      writeState(input.loopDir, input.state)
+      if (!exhausted) {
+        writeContinuationPackage({
+          loopDir: input.loopDir,
+          round: input.round,
+          nextRound: input.state.current_round,
+          maxRounds: input.state.max_rounds,
+          workerRoundCount: input.state.worker_round_count ?? 0,
+          loopPhase: input.state.phase,
+          reviewText: feedback,
+          verification: finalizeVerification,
+          changedFiles: finalizePatchArtifact.eval_patch.changed_files,
+          patchSha256: finalizePatchArtifact.eval_patch.sha256,
+          feedbackPath,
+        })
+      }
+      writeRoundState({
+        loopDir: input.loopDir,
+        loopID: input.state.loop_id,
+        round: input.round,
+        phase: "round_finished",
+        loopPhase: input.state.phase,
+        sessionID: input.state.previous_round_session_id,
+        status: input.state.status,
+      })
+      appendRoundEvent({
+        loopDir: input.loopDir,
+        loopID: input.state.loop_id,
+        round: input.round,
+        type: "round_finished",
+        sessionID: input.state.previous_round_session_id,
+        data: {
+          status: input.state.status,
+          phase: input.state.phase,
+          reason: "build_gate_failed",
+          verification: artifactPaths(input.loopDir, input.round).verification,
+        },
+      })
+      writeRoundResult({
+        loopDir: input.loopDir,
+        loopID: input.state.loop_id,
+        round: input.round,
+        status: input.state.status,
+        loopPhase: input.state.phase,
+        failure: exhausted ? { max_rounds_without_build_success: true } : { build_gate_failed: true },
+        reviewMarker: input.state.last_review_marker,
+        plannerBackend: input.state.planner_backend,
+        plannerModel: plannerModelFromState(input.state, input.cfg),
+        reviewerBackend: input.state.reviewer_backend,
+        reviewerModel: reviewerModelFromState(input.state, input.cfg),
+        metrics: roundMetrics(input.loopDir, input.round, finalizePatchArtifact, input.state.last_review_marker),
+      })
+      writeRoundTrajectory({
+        loopDir: input.loopDir,
+        loopID: input.state.loop_id,
+        round: input.round,
+        sessionID: input.state.previous_round_session_id,
+        mode: input.state.trajectory_mode,
+      })
+      writeRoundEvidence({ loopDir: input.loopDir, round: input.round })
+      try {
+        exportReplayCase({ loopDir: input.loopDir, round: input.round })
+      } catch {
+        // Finalize has no reviewer decision artifact; keep verification/result artifacts authoritative.
+      }
+      if (!exhausted) {
+        await maybePromptNextPhase(input.client, input.cfg, input.loopDir, input.state, input.round)
+      }
+      return
+    }
+  }
+
   input.state.status = "complete"
   input.state.phase = "complete"
   writeState(input.loopDir, input.state)
@@ -1166,7 +1441,7 @@ async function handleFinalizeIdle(input: {
     plannerModel: plannerModelFromState(input.state, input.cfg),
     reviewerBackend: input.state.reviewer_backend,
     reviewerModel: reviewerModelFromState(input.state, input.cfg),
-    metrics: roundMetrics(input.loopDir, input.round, undefined, input.state.last_review_marker),
+    metrics: roundMetrics(input.loopDir, input.round, finalizePatchArtifact, input.state.last_review_marker),
   })
   writeRoundTrajectory({
     loopDir: input.loopDir,
@@ -1200,13 +1475,161 @@ function roundFailure(
   round: number,
   maxRounds: number,
   patchArtifact: PatchArtifact,
+  verification?: RoundVerificationArtifact,
 ): FailureClassificationInput | null {
   if (marker === "complete") return null
   if (status === "cancelled") return { status: "cancelled" }
   if (patchArtifact.checks.apply_check.status === "failed") return { patch_apply_status: "failed" }
   if (patchArtifact.eval_patch.empty) return { empty_patch: true }
+  if (status === "stopped" && verification && !verificationPassed(verification)) {
+    return { max_rounds_without_build_success: true }
+  }
   if (status === "stopped" && marker === "continue" && round >= maxRounds) return { max_rounds_reached: true }
   return {}
+}
+
+function runVerificationCommand(input: {
+  cfg: PactPluginOptions
+  projectRoot: string
+  loopDir: string
+  round: number
+  patchArtifact: PatchArtifact
+  source: RoundVerificationArtifact["source"]
+}): RoundVerificationArtifact | undefined {
+  const command = input.cfg.verificationCommand
+  if (!command) return undefined
+  const started = Date.now()
+  const paths = artifactPaths(input.loopDir, input.round)
+  const result = spawnSync(command, {
+    cwd: input.projectRoot,
+    shell: true,
+    encoding: "utf-8",
+    timeout: input.cfg.verificationTimeoutMs ?? PACT_PLUGIN_DEFAULTS.verificationTimeoutMs,
+    maxBuffer: 20 * 1024 * 1024,
+    env: {
+      ...process.env,
+      PACT_LOOP_DIR: input.loopDir,
+      PACT_ROUND: String(input.round),
+      PACT_PATCH_PATH: input.patchArtifact.eval_patch.path,
+      PACT_PATCH_ARTIFACT: paths.patchArtifact,
+      PACT_VERIFICATION_PATH: paths.verification,
+      PACT_VERIFICATION_LOG: paths.verificationLog,
+      PACT_PROJECT_ROOT: input.projectRoot,
+    },
+  })
+  const stdout = String(result.stdout ?? "")
+  const stderr = String(result.stderr ?? "")
+  const parsed = parseVerificationStdout(stdout)
+  const timedOut = Boolean(result.error && /timed out|ETIMEDOUT/i.test(String(result.error)))
+  const status =
+    timedOut
+      ? "timeout"
+      : verificationStatusFrom(parsed.status, result.status)
+  const logText = [
+    parsed.rawJson ? "" : stdout,
+    stderr,
+    result.error ? String(result.error) : "",
+  ]
+    .filter(Boolean)
+    .join("\n")
+  return writeVerificationArtifact({
+    loopDir: input.loopDir,
+    round: input.round,
+    command,
+    status,
+    exitCode: result.status,
+    durationMs: Date.now() - started,
+    patchSha256: input.patchArtifact.eval_patch.sha256,
+    applied: parsed.applied,
+    resolved: parsed.resolved,
+    buildStatus: parsed.buildStatus,
+    f2p: parsed.f2p,
+    p2p: parsed.p2p,
+    errorCategories: parsed.errorCategories,
+    failureSignature: parsed.failureSignature,
+    logText,
+    source: input.source,
+  })
+}
+
+function verificationPassed(verification: RoundVerificationArtifact): boolean {
+  if (verification.status !== "passed") return false
+  if (verification.applied === false) return false
+  if (!verification.build_status) return true
+  return ["success", "passed", "ok", "built"].includes(verification.build_status)
+}
+
+function buildGateFeedback(verification: RoundVerificationArtifact): string {
+  return [
+    "PACT build/eval gate failed. Completion is blocked until verification passes with build_status=success.",
+    `Verification status: ${verification.status}`,
+    verification.applied === undefined ? undefined : `Patch applied: ${verification.applied}`,
+    verification.build_status ? `Build status: ${verification.build_status}` : undefined,
+    verification.failure_signature ? `Failure signature: ${verification.failure_signature}` : undefined,
+    verification.log_tail ? `\nLatest verification log tail:\n${verification.log_tail}` : undefined,
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n")
+}
+
+function parseVerificationStdout(stdout: string): {
+  rawJson?: Record<string, unknown>
+  status?: unknown
+  buildStatus?: string
+  applied?: boolean
+  resolved?: boolean
+  f2p?: { passed: number; total: number }
+  p2p?: { passed: number; total: number }
+  errorCategories?: string[]
+  failureSignature?: string
+} {
+  const text = stdout.trim()
+  if (!text) return {}
+  const candidate = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.startsWith("{") && line.endsWith("}"))
+  if (!candidate) return {}
+  try {
+    const json = JSON.parse(candidate) as Record<string, unknown>
+    const build = objectProperty(json, "build")
+    return {
+      rawJson: json,
+      status: json.status,
+      buildStatus: stringProperty(json, "build_status") ?? (isRecord(build) ? stringProperty(build, "status") : undefined),
+      applied: booleanProperty(json, "applied"),
+      resolved: booleanProperty(json, "resolved"),
+      f2p: countsProperty(json, "f2p"),
+      p2p: countsProperty(json, "p2p"),
+      errorCategories: arrayStringProperty(json, "error_categories"),
+      failureSignature: stringProperty(json, "failure_signature"),
+    }
+  } catch {
+    return {}
+  }
+}
+
+function verificationStatusFrom(status: unknown, exitStatus: number | null): RoundVerificationArtifact["status"] {
+  if (status === "passed" || status === "success" || status === "ok") return "passed"
+  if (status === "timeout") return "timeout"
+  if (status === "infra_failed") return "infra_failed"
+  if (status === "failed" || status === "failure") return "failed"
+  return exitStatus === 0 ? "passed" : "failed"
+}
+
+function countsProperty(record: Record<string, unknown>, key: string): { passed: number; total: number } | undefined {
+  const value = objectProperty(record, key)
+  if (!isRecord(value)) return undefined
+  const passed = numberProperty(value, "passed")
+  const total = numberProperty(value, "total")
+  if (passed === undefined || total === undefined) return undefined
+  return { passed, total }
+}
+
+function arrayStringProperty(record: Record<string, unknown>, key: string): string[] | undefined {
+  const value = record[key]
+  if (!Array.isArray(value)) return undefined
+  return value.filter((item): item is string => typeof item === "string")
 }
 
 function roundMetrics(
@@ -1260,11 +1683,25 @@ function benchmarkNetworkBlock(tool: string, args: unknown): { host: string } | 
 }
 
 function benchmarkCommandBlock(
+  projectRoot: string,
   tool: string,
   args: unknown,
-): { reason: string; tests: string[] } | undefined {
+): { reason: string; tests?: string[]; target?: string } | undefined {
   if (tool !== "bash") return undefined
   const command = shellCommandText(args)
+  if (/\bgit\s+(?:add|reset|commit|stash|clean|checkout|switch)\b/i.test(command)) {
+    return { reason: "benchmark_strict_git_index", target: "git-index" }
+  }
+  if (/\blolbench_eval\.py\b[\s\S]*\bpact-gate\b/i.test(command) || /\bpact-gate\b[\s\S]*\blolbench_eval\.py\b/i.test(command)) {
+    return { reason: "benchmark_strict_pact_gate", target: "pact-gate" }
+  }
+  if (/\b(?:solution|test)\.patch\b/i.test(command)) {
+    return { reason: "benchmark_strict_scaffolding_patch", target: "benchmark-patch-file" }
+  }
+  const externalPath = benchmarkShellExternalPath(projectRoot, command)
+  if (externalPath) {
+    return { reason: "benchmark_strict_external_path", target: externalPath }
+  }
   if (!/(\bpython(?:\d+(?:\.\d+)?)?(?:\.exe)?\b|\b\.\/python(?:\.exe)?\b).*?\s-m\s+test\b/i.test(command)) {
     return undefined
   }
@@ -1272,6 +1709,19 @@ function benchmarkCommandBlock(
   const hasHighRiskTest = tests.some((name) => HIGH_RISK_CPYTHON_TESTS.has(name))
   if (!hasHighRiskTest && tests.length > 0 && tests.length <= 6) return undefined
   return { reason: "benchmark_strict_broad_cpython_tests", tests }
+}
+
+function benchmarkShellExternalPath(projectRoot: string, command: string): string | undefined {
+  if (!/\b(?:cat|sed|head|tail|grep|rg|ls|find|awk|perl)\b/.test(command)) return undefined
+  const absolutePaths = command.match(/\/[^\s'"`|;&)]+/g) ?? []
+  for (const rawPath of absolutePaths) {
+    const absolutePath = rawPath.replace(/[,:.]+$/, "")
+    if (isInsideProject(projectRoot, absolutePath)) continue
+    if (absolutePath.includes("/LoLBench/") || absolutePath.endsWith("/lolbench_eval.py")) {
+      return basename(absolutePath) || absolutePath
+    }
+  }
+  return undefined
 }
 
 const HIGH_RISK_CPYTHON_TESTS = new Set(["test_subprocess", "test_threading"])
@@ -1291,9 +1741,72 @@ function benchmarkPathBlock(
   return { reason: "benchmark_strict_external_path", path: basename(absolute) || filePath }
 }
 
+function benchmarkPactArtifactReadBlock(
+  projectRoot: string,
+  tool: string,
+  args: unknown,
+): { reason: string; path: string } | undefined {
+  if (tool === "bash") return benchmarkPactArtifactShellReadBlock(projectRoot, shellCommandText(args))
+  if (!["read", "grep", "glob"].includes(tool)) return undefined
+  const paths = fileToolPaths(tool, args)
+  const text = collectStrings(args).join("\n")
+  if (tool === "glob" && /\B\.pact(?:\/|$)|(?:^|\/)\.pact(?:\/|$)/.test(text)) {
+    return { reason: "benchmark_strict_pact_artifact", path: ".pact" }
+  }
+  for (const filePath of paths) {
+    const absolute = resolveProjectPath(projectRoot, filePath)
+    if (!isInsideProject(projectRoot, absolute)) continue
+    const relativePath = relative(projectRoot, absolute).replaceAll("\\", "/")
+    if (relativePath === ".pact") return { reason: "benchmark_strict_pact_artifact", path: relativePath }
+    if (!relativePath.startsWith(".pact/")) continue
+    if (tool !== "read" || !isWorkerReadablePactArtifact(relativePath)) {
+      return { reason: "benchmark_strict_pact_artifact", path: relativePath }
+    }
+  }
+  return undefined
+}
+
+function benchmarkPactArtifactShellReadBlock(
+  projectRoot: string,
+  command: string,
+): { reason: string; path: string } | undefined {
+  if (!/\b(?:cat|sed|head|tail|grep|rg|ls|find|awk|perl)\b/.test(command)) return undefined
+  if (!/(^|[\s'"`])\.pact(?:\/|[\s'"`]|$)/.test(command)) return undefined
+  const absolutePaths = command.match(/\/[^\s'"`|;&)]+/g) ?? []
+  for (const rawPath of absolutePaths) {
+    const absolutePath = rawPath.replace(/[,:.]+$/, "")
+    if (!isInsideProject(projectRoot, absolutePath)) continue
+    const relativePath = relative(projectRoot, absolutePath).replaceAll("\\", "/")
+    if (relativePath.startsWith(".pact/") && !isWorkerReadablePactArtifact(relativePath)) {
+      return { reason: "benchmark_strict_pact_artifact", path: relativePath }
+    }
+  }
+  return { reason: "benchmark_strict_pact_artifact", path: ".pact" }
+}
+
+function isWorkerReadablePactArtifact(relativePath: string): boolean {
+  return (
+    /^\.pact\/loops\/[^/]+\/(?:plan|todo|goal-tracker|source-plan)\.md$/.test(relativePath) ||
+    /^\.pact\/loops\/[^/]+\/round-\d+-(?:prompt|continuation-package|contract|summary)\.md$/.test(relativePath) ||
+    /^\.pact\/loops\/[^/]+\/round-\d+-pre-snapshot\.json$/.test(relativePath)
+  )
+}
+
 function benchmarkToolBlock(tool: string): { reason: string } | undefined {
   if (tool !== "task") return undefined
   return { reason: "benchmark_strict_task_delegation" }
+}
+
+function benchmarkScaffoldingPatchWriteBlock(
+  projectRoot: string,
+  absolutePath: string,
+): { reason: string; path: string } | undefined {
+  if (!isInsideProject(projectRoot, absolutePath)) return undefined
+  const relativePath = relative(projectRoot, absolutePath)
+  if (relativePath === "solution.patch" || relativePath === "test.patch") {
+    return { reason: "benchmark_strict_scaffolding_patch", path: relativePath }
+  }
+  return undefined
 }
 
 function isFileWriteTool(tool: string): boolean {
@@ -1340,6 +1853,25 @@ function eventSessionID(event: unknown): string | undefined {
 function objectProperty(value: unknown, key: string): unknown {
   if (!value || typeof value !== "object") return undefined
   return Reflect.get(value, key)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value)
+}
+
+function stringProperty(value: Record<string, unknown>, key: string): string | undefined {
+  const item = value[key]
+  return typeof item === "string" ? item : undefined
+}
+
+function numberProperty(value: Record<string, unknown>, key: string): number | undefined {
+  const item = value[key]
+  return typeof item === "number" ? item : undefined
+}
+
+function booleanProperty(value: Record<string, unknown>, key: string): boolean | undefined {
+  const item = value[key]
+  return typeof item === "boolean" ? item : undefined
 }
 
 function patchToolPaths(patchText: string): string[] {
@@ -1473,6 +2005,14 @@ function reviewerModelFromState(
   cfg: PactPluginOptions,
 ): string | null {
   return state.reviewer_model ?? reviewerModelForBackend(state.reviewer_backend, cfg)
+}
+
+function verificationConfigForState(state: PactState, cfg: PactPluginOptions): PactPluginOptions {
+  return {
+    ...cfg,
+    verificationCommand: state.verification_command ?? cfg.verificationCommand,
+    verificationTimeoutMs: state.verification_timeout_ms ?? cfg.verificationTimeoutMs,
+  }
 }
 
 function plannerModelForBackend(backend: PlannerBackend, cfg: PactPluginOptions): string | null {

@@ -14,7 +14,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import PactPluginModule, { PactPlugin, PACT_PLUGIN_DEFAULTS, invokeCodexPlanner, invokeCodexReviewer } from "../pact"
-import { createLoop, readState, sha256Text, writeRoundContext, writeState } from "./pact-core"
+import { artifactPaths, createLoop, readState, sha256Text, writeRoundContext, writeState } from "./pact-core"
 
 const tempDirs: string[] = []
 
@@ -100,6 +100,25 @@ cat <<'PACT_FAKE_CODEX_ERROR' >&2
 ${stderr}
 PACT_FAKE_CODEX_ERROR
 exit ${status}
+`,
+    "utf-8",
+  )
+  chmodSync(scriptPath, 0o755)
+  return scriptPath
+}
+
+function fakeVerificationCommand(project: string): string {
+  const scriptPath = join(project, `fake-verify-${Math.random().toString(16).slice(2)}.sh`)
+  writeFileSync(
+    scriptPath,
+    `#!/bin/sh
+cat <<'PACT_FAKE_VERIFY_JSON'
+{"status":"failed","applied":true,"resolved":false,"build_status":"failed","f2p":{"passed":0,"total":3},"p2p":{"passed":0,"total":3},"error_categories":["build_failure"]}
+PACT_FAKE_VERIFY_JSON
+cat <<'PACT_FAKE_VERIFY_LOG' >&2
+TestRecord.java:152: error cannot infer type arguments for ConsumerRecord<>
+PACT_FAKE_VERIFY_LOG
+exit 1
 `,
     "utf-8",
   )
@@ -274,7 +293,7 @@ describe("PACT Codex planner and reviewer", () => {
     })
 
     const result = (await hooks.tool?.["pact-start-loop"].execute(
-      { plan_file: "plan.md", max_rounds: 2 },
+      { plan_file: "plan.md", max_rounds: 2, verification_command: "python3 gate.py pact-gate" },
       {
         sessionID: "ses_worker",
         messageID: "msg_1",
@@ -291,6 +310,8 @@ describe("PACT Codex planner and reviewer", () => {
     expect(canonicalPlan).toContain("Canonicalize the LoLBench task before implementation.")
     expect(manifest.plan_sha256).toBe(sha256Text(canonicalPlan))
     expect(manifest.goal_tracker_immutable_sha256).toBe(readState(loopDir).goal_tracker_immutable_sha256)
+    expect(manifest.verification_enabled).toBe(true)
+    expect(manifest.verification_command).toBe("python3 gate.py pact-gate")
     expect(existsSync(join(loopDir, ".round-history", "artifacts", "round-00-plan-output.md"))).toBe(true)
     expect(readFileSync(join(loopDir, ".round-history", "artifacts", "plan.md"), "utf-8")).toBe(canonicalPlan)
   })
@@ -455,6 +476,72 @@ describe("PACT Codex planner and reviewer", () => {
     })
   })
 
+  test("failing verification gate blocks reviewer complete and feeds next round", async () => {
+    const project = tempGitProject()
+    const loop = createLoop({
+      projectRoot: project,
+      planFile: "plan.md",
+      reviewerBackend: "codex-cli",
+      workerSessionID: "ses_worker",
+      maxRounds: 3,
+    })
+    writeFileSync(join(loop.loopDir, "round-01-prompt.md"), "worker prompt\n", "utf-8")
+    writeRoundContext({
+      loopDir: loop.loopDir,
+      loopID: loop.loopID,
+      round: 1,
+      sessionID: "ses_worker",
+      workerAgent: "pact-worker",
+      reviewerBackend: "codex-cli",
+      promptPath: join(loop.loopDir, "round-01-prompt.md"),
+      todoPath: join(loop.loopDir, "todo.md"),
+      goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+    })
+    writeFileSync(join(loop.loopDir, "round-01-summary.md"), "Worker summary.\n", "utf-8")
+    appendFileSync(join(project, "src.txt"), "after\n", "utf-8")
+    const command = fakeCodex(project, "Review ok.\nPACT_COMPLETE\n")
+    const verifyCommand = fakeVerificationCommand(project)
+    const hooks = await PactPlugin({ client: {}, directory: project, worktree: project } as any, {
+      codexCommand: command,
+      reviewerBackend: "codex-cli",
+      verificationCommand: verifyCommand,
+    })
+
+    await hooks.event?.({ event: { type: "session.idle", properties: { sessionID: "ses_worker" } } as any })
+
+    expect(readState(loop.loopDir)).toMatchObject({
+      status: "running",
+      phase: "implementation",
+      current_round: 2,
+      worker_round_count: 1,
+    })
+    expect(JSON.parse(readFileSync(artifactPaths(loop.loopDir, 1).verification, "utf-8"))).toMatchObject({
+      status: "failed",
+      build_status: "failed",
+      error_categories: ["build_failure"],
+    })
+    expect(JSON.parse(readFileSync(join(loop.loopDir, "round-01-review-decision.json"), "utf-8"))).toMatchObject({
+      marker: "continue",
+      raw_marker: "complete",
+      accepted: false,
+      blocked_by: "build_gate",
+      parse_status: "build_gate_failed",
+    })
+    const packageText = readFileSync(join(loop.loopDir, "round-01-continuation-package.md"), "utf-8")
+    const nextPrompt = readFileSync(join(loop.loopDir, "round-02-prompt.md"), "utf-8")
+    expect(packageText).not.toContain("TestRecord.java:152")
+    expect(packageText).not.toContain("F2P")
+    expect(packageText).not.toContain("P2P")
+    expect(packageText).not.toContain("eval_tests.patch")
+    expect(packageText).not.toContain("Latest Verification Log Tail")
+    expect(packageText).toContain("Use the worker-safe continuation package and changed files to make workspace-only source changes")
+    expect(readFileSync(join(loop.loopDir, "round-02-prompt.md"), "utf-8")).toContain("Current Round Package Summary")
+    expect(nextPrompt).not.toContain("TestRecord.java:152")
+    expect(nextPrompt).not.toContain("F2P")
+    expect(nextPrompt).not.toContain("P2P")
+    expect(nextPrompt).not.toContain("eval_tests.patch")
+  })
+
   test("deprecated PACT_STOP still continues the implementation loop", async () => {
     const project = tempGitProject()
     const loop = createLoop({
@@ -590,8 +677,10 @@ describe("PACT Codex planner and reviewer", () => {
       { tool: "bash", callID: "call_round3", sessionID: "ses_round3" } as any,
       { args: { command: "true" } } as any,
     )
-    expect(readState(loop.loopDir).active_round_session_id).toBeUndefined()
-    expect(readState(loop.loopDir).active_session_id).toBeUndefined()
+    expect(readState(loop.loopDir)).toMatchObject({
+      active_round_session_id: "ses_round3",
+      active_session_id: "ses_round3",
+    })
     await hooks["tool.execute.before"]?.(
       { tool: "write", callID: "call_round3_summary", sessionID: "ses_round3" } as any,
       {
@@ -605,6 +694,9 @@ describe("PACT Codex planner and reviewer", () => {
       active_round_session_id: "ses_round3",
       active_session_id: "ses_round3",
     })
+    const events = readFileSync(join(loop.loopDir, "round-03-events.jsonl"), "utf-8")
+    expect(events).toContain('"call_id":"call_round3"')
+    expect(events).toContain('"call_id":"call_round3_summary"')
     await hooks.event?.({ event: { type: "session.idle", properties: { sessionID: "ses_round3" } } as any })
 
     expect(readState(loop.loopDir)).toMatchObject({ status: "complete", phase: "complete" })
@@ -614,6 +706,74 @@ describe("PACT Codex planner and reviewer", () => {
       loop_phase: "complete",
       failure_category: null,
     })
+  })
+
+  test("finalize verification failure returns to implementation with a continuation package", async () => {
+    const project = tempGitProject()
+    const loop = createLoop({
+      projectRoot: project,
+      planFile: "plan.md",
+      reviewerBackend: "codex-cli",
+      workerSessionID: "ses_worker",
+      maxRounds: 4,
+    })
+    const state = readState(loop.loopDir)
+    state.phase = "finalize"
+    state.current_round = 3
+    state.worker_round_count = 2
+    state.previous_round_session_id = "ses_review"
+    state.active_round_session_id = "ses_round3"
+    state.active_session_id = "ses_round3"
+    writeState(loop.loopDir, state)
+    writeFileSync(join(loop.loopDir, "round-03-prompt.md"), "finalize phase prompt\n", "utf-8")
+    writeFileSync(join(loop.loopDir, "round-03-context.json"), JSON.stringify({
+      schema: "pact-round-context/v1",
+      artifact_version: 1,
+      loop_id: loop.loopID,
+      round: 3,
+      session_id: "ses_round3",
+      worker_agent: "pact-worker",
+      reviewer_backend: "codex-cli",
+      context_hashes: {},
+      created_at: new Date().toISOString(),
+      prompt_path: join(loop.loopDir, "round-03-prompt.md"),
+      todo_path: join(loop.loopDir, "todo.md"),
+      goal_tracker_path: join(loop.loopDir, "goal-tracker.md"),
+    }, null, 2), "utf-8")
+    writeFileSync(join(loop.loopDir, "finalize-summary.md"), "Final verification done.\n", "utf-8")
+    appendFileSync(join(project, "src.txt"), "finalize tweak\n", "utf-8")
+    const hooks = await PactPlugin({ client: {}, directory: project, worktree: project } as any, {
+      reviewerBackend: "codex-cli",
+      verificationCommand: fakeVerificationCommand(project),
+    })
+
+    await hooks.event?.({ event: { type: "session.idle", properties: { sessionID: "ses_round3" } } as any })
+
+    expect(readState(loop.loopDir)).toMatchObject({
+      status: "running",
+      phase: "implementation",
+      current_round: 4,
+      worker_round_count: 2,
+      last_verification_status: "failed",
+      last_verification_build_status: "failed",
+    })
+    expect(existsSync(join(loop.loopDir, "complete-state.md"))).toBe(false)
+    expect(JSON.parse(readFileSync(artifactPaths(loop.loopDir, 3).verification, "utf-8"))).toMatchObject({
+      status: "failed",
+      applied: true,
+      build_status: "failed",
+    })
+    expect(JSON.parse(readFileSync(join(loop.loopDir, "round-03-result.json"), "utf-8"))).toMatchObject({
+      status: "running",
+      loop_phase: "implementation",
+      failure_category: "build_gate_failed",
+    })
+    const packageText = readFileSync(join(loop.loopDir, "round-03-continuation-package.md"), "utf-8")
+    const nextPrompt = readFileSync(join(loop.loopDir, "round-04-prompt.md"), "utf-8")
+    expect(packageText).not.toContain("TestRecord.java:152")
+    expect(packageText).not.toContain("Latest Verification Log Tail")
+    expect(nextPrompt).not.toContain("TestRecord.java:152")
+    expect(nextPrompt).toContain("Current Round Package Summary")
   })
 
   test("codex-cli reviewer failure writes reviewer_failed artifacts", async () => {
@@ -756,7 +916,7 @@ describe("PACT Codex planner and reviewer", () => {
     })
   })
 
-  test("new-per-round loops only bind the fresh worker session on the expected summary write", async () => {
+  test("new-per-round loops bind the fresh worker session on the first observed tool event", async () => {
     const project = tempGitProject()
     const loop = createLoop({
       projectRoot: project,
@@ -776,14 +936,16 @@ describe("PACT Codex planner and reviewer", () => {
     const hooks = await PactPlugin({ client: {}, directory: project, worktree: project } as any)
 
     await hooks["tool.execute.before"]?.(
-      { tool: "read", callID: "call_unrelated_read", sessionID: "ses_unrelated" } as any,
+      { tool: "read", callID: "call_first_read", sessionID: "ses_round2" } as any,
       { args: { filePath: "src.txt" } } as any,
     )
 
     let nextState = readState(loop.loopDir)
-    expect(nextState.active_round_session_id).toBeUndefined()
-    expect(nextState.active_session_id).toBeUndefined()
-    expect(nextState.previous_round_session_id).toBe("ses_round1")
+    expect(nextState).toMatchObject({
+      active_round_session_id: "ses_round2",
+      active_session_id: "ses_round2",
+      previous_round_session_id: "ses_round1",
+    })
 
     await hooks["tool.execute.before"]?.(
       { tool: "write", callID: "call_write_round2_summary", sessionID: "ses_round2" } as any,
@@ -797,10 +959,33 @@ describe("PACT Codex planner and reviewer", () => {
       previous_round_session_id: "ses_round1",
     })
     const events = readFileSync(join(loop.loopDir, "round-02-events.jsonl"), "utf-8")
-    expect(events).not.toContain('"session_id":"ses_unrelated"')
+    expect(events).toContain('"tool":"read"')
+    expect(events).toContain('"call_id":"call_first_read"')
     expect(events).toContain('"tool":"write"')
     expect(events).toContain('"call_id":"call_write_round2_summary"')
     expect(events).toContain('"session_id":"ses_round2"')
+  })
+
+  test("run-exit round boundary ignores session idle review hooks", async () => {
+    const project = tempGitProject()
+    const loop = createLoop({
+      projectRoot: project,
+      planFile: "plan.md",
+      workerSessionID: "ses_worker",
+      roundBoundary: "run_exit",
+    } as any)
+    writeFileSync(join(loop.loopDir, "round-01-summary.md"), "Worker summary.\n", "utf-8")
+    writeFileSync(join(loop.loopDir, "round-01-contract.md"), "Worker contract.\n", "utf-8")
+    const hooks = await PactPlugin({ client: {}, directory: project, worktree: project } as any)
+
+    await hooks.event?.({ event: { type: "session.idle", properties: { sessionID: "ses_worker" } } as any })
+
+    expect(existsSync(join(loop.loopDir, "round-01-review.md"))).toBe(false)
+    expect(readState(loop.loopDir)).toMatchObject({
+      status: "running",
+      phase: "implementation",
+      current_round: 1,
+    })
   })
 
   test("new-per-round loops bind when the expected summary is created by apply_patch", async () => {
@@ -954,6 +1139,59 @@ describe("PACT Codex planner and reviewer", () => {
     ).resolves.toBeUndefined()
   })
 
+  test("benchmark strict mode blocks worker-owned patch export and gate commands", async () => {
+    const project = tempGitProject()
+    const loop = createLoop({
+      projectRoot: project,
+      planFile: "plan.md",
+      workerSessionID: "ses_worker",
+    })
+    const hooks = await PactPlugin({ client: {}, directory: project, worktree: project } as any, {
+      benchmarkStrictNetwork: true,
+    })
+
+    await expect(
+      hooks["tool.execute.before"]?.(
+        { tool: "bash", callID: "call_patch_export", sessionID: "ses_worker" } as any,
+        { args: { command: "git add Lib/tomllib && git diff --cached --no-color > solution.patch" } } as any,
+      ),
+    ).rejects.toThrow("blocked benchmark-owned command")
+
+    await expect(
+      hooks["tool.execute.before"]?.(
+        { tool: "bash", callID: "call_pact_gate", sessionID: "ses_worker" } as any,
+        { args: { command: "PACT_PATCH_PATH=$(pwd)/solution.patch python3 scripts/lolbench_eval.py pact-gate" } } as any,
+      ),
+    ).rejects.toThrow("blocked benchmark-owned command")
+
+    const events = readFileSync(join(loop.loopDir, "round-01-events.jsonl"), "utf-8")
+    expect(events).toContain('"reason":"benchmark_strict_git_index"')
+    expect(events).toContain('"reason":"benchmark_strict_pact_gate"')
+  })
+
+  test("benchmark strict mode blocks direct writes to harness-owned patch files", async () => {
+    const project = tempGitProject()
+    const loop = createLoop({
+      projectRoot: project,
+      planFile: "plan.md",
+      workerSessionID: "ses_worker",
+    })
+    const hooks = await PactPlugin({ client: {}, directory: project, worktree: project } as any, {
+      benchmarkStrictNetwork: true,
+    })
+
+    await expect(
+      hooks["tool.execute.before"]?.(
+        { tool: "write", callID: "call_solution_patch", sessionID: "ses_worker" } as any,
+        { args: { filePath: "solution.patch", content: "diff --git a/x b/x\n" } } as any,
+      ),
+    ).rejects.toThrow("blocked benchmark-owned patch file")
+
+    const events = readFileSync(join(loop.loopDir, "round-01-events.jsonl"), "utf-8")
+    expect(events).toContain('"reason":"benchmark_strict_scaffolding_patch"')
+    expect(events).toContain('"solution.patch"')
+  })
+
   test("benchmark strict mode blocks file reads outside the workspace and records the attempt", async () => {
     const project = tempGitProject()
     const outside = mkdtempSync(join(tmpdir(), "pact-plugin-outside-"))
@@ -983,6 +1221,36 @@ describe("PACT Codex planner and reviewer", () => {
     expect(events).toContain("_parser.py")
   })
 
+  test("benchmark strict mode blocks bash reads of LoLBench harness files outside the workspace", async () => {
+    const project = tempGitProject()
+    const loop = createLoop({
+      projectRoot: project,
+      planFile: "plan.md",
+      workerSessionID: "ses_worker",
+    })
+    const hooks = await PactPlugin({ client: {}, directory: project, worktree: project } as any, {
+      benchmarkStrictNetwork: true,
+    })
+
+    await expect(
+      hooks["tool.execute.before"]?.(
+        { tool: "bash", callID: "call_external_harness_read", sessionID: "ses_worker" } as any,
+        {
+          args: {
+            command:
+              "sed -n '70,200p' /Users/gujiazhen/Documents/cc_codes/benchmark/LoLBench/scripts/lolbench_eval.py",
+          },
+        } as any,
+      ),
+    ).rejects.toThrow("blocked workspace-external file access")
+
+    const events = readFileSync(join(loop.loopDir, "round-01-events.jsonl"), "utf-8")
+    expect(events).toContain('"tool":"bash"')
+    expect(events).toContain('"status":"blocked"')
+    expect(events).toContain('"reason":"benchmark_strict_external_path"')
+    expect(events).toContain("lolbench_eval.py")
+  })
+
   test("benchmark strict mode allows file reads inside the workspace", async () => {
     const project = tempGitProject()
     createLoop({
@@ -1000,6 +1268,63 @@ describe("PACT Codex planner and reviewer", () => {
         { args: { filePath: "src.txt" } } as any,
       ),
     ).resolves.toBeUndefined()
+  })
+
+  test("benchmark strict mode blocks worker reads of reviewer-only PACT artifacts", async () => {
+    const project = tempGitProject()
+    const loop = createLoop({
+      projectRoot: project,
+      planFile: "plan.md",
+      workerSessionID: "ses_worker",
+    })
+    writeFileSync(join(loop.loopDir, "round-01-continuation-package.md"), "safe package\n", "utf-8")
+    writeFileSync(join(loop.loopDir, "round-01-feedback.md"), "F2P: 1/3\nP2P: 3/3\n", "utf-8")
+    writeFileSync(join(loop.loopDir, "round-01-verification.json"), '{"f2p":{"passed":1,"total":3}}\n', "utf-8")
+    writeFileSync(join(loop.loopDir, "round-01-verification.log"), "hidden eval test detail\n", "utf-8")
+    writeFileSync(join(loop.loopDir, "round-01-review.md"), "reviewer-only output\n", "utf-8")
+    writeFileSync(join(loop.loopDir, "replay-case.json"), '{"verification":{"log_tail":"hidden"}}\n', "utf-8")
+    writeFileSync(join(loop.loopDir, "final-hidden-gate-summary.json"), '{"f2p":{"passed":1,"total":3}}\n', "utf-8")
+    writeFileSync(join(loop.loopDir, "final-hidden-gate-orig.json"), '{"p2p":{"passed":3,"total":3}}\n', "utf-8")
+    writeFileSync(join(loop.loopDir, "final-hidden-gate-orig.log"), "hidden final detail\n", "utf-8")
+    const hooks = await PactPlugin({ client: {}, directory: project, worktree: project } as any, {
+      benchmarkStrictNetwork: true,
+    })
+
+    await expect(
+      hooks["tool.execute.before"]?.(
+        { tool: "read", callID: "call_safe_package", sessionID: "ses_worker" } as any,
+        { args: { filePath: join(loop.loopDir, "round-01-continuation-package.md") } } as any,
+      ),
+    ).resolves.toBeUndefined()
+
+    for (const [callID, fileName] of [
+      ["call_feedback", "round-01-feedback.md"],
+      ["call_verification", "round-01-verification.json"],
+      ["call_verification_log", "round-01-verification.log"],
+      ["call_review", "round-01-review.md"],
+      ["call_replay", "replay-case.json"],
+      ["call_final_hidden_summary", "final-hidden-gate-summary.json"],
+      ["call_final_hidden_json", "final-hidden-gate-orig.json"],
+      ["call_final_hidden_log", "final-hidden-gate-orig.log"],
+    ] as const) {
+      await expect(
+        hooks["tool.execute.before"]?.(
+          { tool: "read", callID, sessionID: "ses_worker" } as any,
+          { args: { filePath: join(loop.loopDir, fileName) } } as any,
+        ),
+      ).rejects.toThrow("worker-safe PACT artifact")
+    }
+
+    await expect(
+      hooks["tool.execute.before"]?.(
+        { tool: "glob", callID: "call_glob_pact", sessionID: "ses_worker" } as any,
+        { args: { path: join(project, ".pact"), pattern: "**/*" } } as any,
+      ),
+    ).rejects.toThrow("worker-safe PACT artifact")
+
+    const events = readFileSync(join(loop.loopDir, "round-01-events.jsonl"), "utf-8")
+    expect(events).toContain('"reason":"benchmark_strict_pact_artifact"')
+    expect(events).toContain("round-01-verification.json")
   })
 
   test("benchmark strict mode blocks task delegation and records the attempt", async () => {

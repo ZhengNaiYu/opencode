@@ -4,7 +4,13 @@
 
 Make each OpenCode PACT round self-explaining, replay-exportable, and governed by a Humanize-style review loop.
 
-Today the plugin can start a PACT loop, keep a todo and goal tracker, wait for a worker summary, run a reviewer, and continue from reviewer feedback. v1 extends that into a Humanize-inspired loop with a stronger plan ledger, protected goal tracker, full alignment checks, review phase, finalize phase, and replay artifacts.
+Today the plugin can start a PACT loop, keep a todo and goal tracker, run a worker, run a reviewer, and continue from reviewer feedback. v1 extends that into a Humanize-inspired loop with a stronger plan ledger, protected goal tracker, full alignment checks, review phase, finalize phase, and replay artifacts.
+
+For CLI and LoLBench, the default round boundary is driver-owned `opencode run` exit: one worker process equals one round. When the worker process exits, the driver synchronously captures patch/snapshot/trajectory artifacts, invokes the reviewer, writes the result/replay bundle, and emits the next round prompt. The OpenCode `session.idle` path remains as an interactive fallback.
+
+In benchmark strict mode, worker prompts and tool reads are separated from reviewer-only evidence. The worker can read canonical plan/ledger files, its prompt, contract, summary, continuation package, and pre-snapshot. Raw feedback, verification logs, replay bundles, event logs, evidence, review outputs, and captured patches remain available for the driver, reviewer, reports, and humans, but are not fed back into worker rounds by default.
+
+LoLBench defaults now use a public-loop/final-hidden split. Each worker round may run only worker-safe round verification: patch apply plus an optional public build/self-check command. It must not run LoLBench hidden `pact-gate`, must not apply `eval_tests.patch`, and must not expose F2P/P2P to the worker. Only after the reviewer writes candidate `PACT_COMPLETE` does the driver run the LoLBench hidden final gate for scoring/reporting artifacts. Hidden final failure stops the loop as unresolved; it is not reopened into worker feedback in v1.
 
 v1 adds a small artifact chain under `.pact/loops/<loopID>/` so every round can answer:
 
@@ -23,7 +29,7 @@ v1 adds a small artifact chain under `.pact/loops/<loopID>/` so every round can 
 - No raw provider request or response dumps.
 - No full transcript dump as the default artifact.
 - No OpenCode core changes unless plugin-only implementation hits a hard blocker.
-- No true Claude Code-style Stop hook in v1. OpenCode PACT uses `session.idle` as the reviewer gate.
+- No true Claude Code-style Stop hook in v1. CLI/LoLBench uses driver-owned `opencode run` exit as the reviewer gate; OpenCode `session.idle` remains a fallback for interactive server usage.
 - No BitLesson, push-every-round, plan quiz, or Claude-specific Task system.
 
 ## Stage Model
@@ -32,11 +38,13 @@ v1 adds a small artifact chain under `.pact/loops/<loopID>/` so every round can 
 | --------------------- | --------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | Loop Start            | Plan file, project root, worker session, max rounds, full alignment interval, planner backend/model, reviewer backend/model, worker backend/model/config source | `state.json`, `loop-manifest.json`, `plan.md`, `todo.md`, `goal-tracker.md`, workspace `.git/info/exclude` | Establish run identity, goal, plan anchor, active session, worker attribution, and loop phase. |
 | Round Start           | Current state, todo, goal tracker, previous feedback                                                                        | `round-XX-state.json`, `round-XX-context.json`                                                             | Explain the checkpoint input and provide replay context.                                     |
-| Worker Execution      | Worker prompt, repository state, summarized tool events                                                                     | `round-XX-events.jsonl`, `round-XX-summary.md`                                                             | Show key actions and detect missing summary or worker failure.                               |
-| Patch Capture         | Repository diff at round end                                                                                                | `round-XX-workspace.patch`, `round-XX-eval.patch`, `round-XX-patch-artifact.json`                          | Determine empty patch, changed files, patch hash, and replay or eval candidate.              |
-| Implementation Review | Plan, goal tracker, round summary, patch artifact                                                                           | `round-XX-review-prompt.md`, `round-XX-review.md`, `round-XX-review-decision.json`, `round-XX-feedback.md` | Gate implementation progress and produce continuation or review-phase input.                 |
+| Worker Execution      | Worker prompt, repository state, summarized tool events                                                                     | `round-XX-events.jsonl`, `round-XX-contract.md`, `round-XX-summary.md`                                      | Show key actions, worker-declared scope, and detect missing summary or worker failure.        |
+| Patch Capture         | Repository diff at round end                                                                                                | `round-XX-workspace.patch`, `round-XX-eval.patch`, `round-XX-test.patch`, `round-XX-patch-artifact.json`    | Determine empty patch, changed files, patch hash, and replay or eval candidate.              |
+| Public Round Verification | Round eval patch, patch metadata, optional public build/self-check command                                               | `round-XX-verification.json`, `round-XX-verification.log`                                                  | Check patch apply/public build facts without hidden benchmark feedback.                      |
+| Implementation Review | Plan, goal tracker, round summary, patch artifact, public verification                                                       | `round-XX-review-prompt.md`, `round-XX-review.md`, `round-XX-review-decision.json`, `round-XX-feedback.md` | Gate implementation progress and produce continuation or review-phase input.                 |
 | Full Alignment Review | Plan, goal tracker, recent round history, patch artifact                                                                    | `round-XX-review-prompt.md`, `round-XX-review.md`, `round-XX-feedback.md`                                  | Detect forgotten ACs, unjustified deferrals, and stalled progress without stopping the loop. |
 | Review Phase          | Completed implementation signal, current patch, round summary                                                               | `round-XX-review-prompt.md`, `round-XX-review.md`, `round-XX-feedback.md`                                  | Perform a code-review-oriented pass before finalization.                                     |
+| Final Hidden Gate     | Reviewer candidate completion, eval patch, LoLBench suite selection                                                         | `final-hidden-gate-<suite>.json`, `final-hidden-gate-<suite>.log`, `final-hidden-gate-summary.json`, `final-result.json` | Score/report hidden benchmark outcome without feeding it to workers.                         |
 | Finalize Phase        | Review phase completion, final verification summary                                                                         | `finalize-summary.md`, `complete-state.md`                                                                 | Final verification and terminal completion.                                                  |
 | Round Result          | Round state, events, patch artifact, review decision                                                                        | `round-XX-result.json`                                                                                     | Classify failure and expose minimal metrics for batch analysis.                              |
 | Replay Export         | Round context, worker prompt, feedback, patch/result metadata                                                               | `replay-case.json`                                                                                         | Freeze a checkpoint for repeated execution or future A/B comparison.                         |
@@ -55,6 +63,11 @@ Minimum fields:
 - `plan_file`
 - `created_at`
 - `max_rounds`
+- `next_round`: next worker round cursor
+- `current_round`: deprecated compatibility alias for `next_round`
+- `attempted_worker_rounds`: implementation worker runs that were launched
+- `completed_worker_rounds`: implementation worker runs that exited and reached patch capture
+- `reviewed_worker_rounds`: implementation worker runs with a reviewer decision, including reviewer failure/timeout decisions
 - `full_alignment_interval`
 - `phase_config`
 - `planner_backend`
@@ -163,6 +176,12 @@ v1 default: excludes `.pact/**`, root `solution.patch`, root `test.patch`, and p
 
 Purpose: answer what should be evaluated.
 
+### `round-XX-test.patch`
+
+The optional patch containing worker/public test changes inferred from paths declared inside root `test.patch`.
+
+Purpose: preserve worker test effort for observability without polluting the benchmark/product eval patch.
+
 ### `round-XX-patch-artifact.json`
 
 Patch metadata for both patch files.
@@ -175,11 +194,26 @@ Minimum fields:
 - `primary_patch`: `"eval"`
 - `workspace_patch`: file, sha256, bytes, lines, changed files, empty flag
 - `eval_patch`: file, sha256, bytes, lines, changed files, empty flag
+- `test_patch`: file, sha256, bytes, lines, changed files, empty flag
 - `excluded_scaffolding_files`: metadata for excluded root benchmark files, including path, sha256, bytes, and lines
 - `excluded_test_patch_files`: metadata for worktree files excluded because root `test.patch` declared them
 - `checks`: apply check status and message
 
 Purpose: support batch statistics and avoid trusting worker self-report.
+
+### `round-XX-contract.md`
+
+Worker-authored round contract.
+
+Required fields:
+
+- single mainline objective
+- target ACs
+- blocking issues
+- queued out-of-scope issues
+- success criteria
+
+Purpose: preserve the worker's declared scope for review. The contract is a claim, not an authoritative completion condition. The reviewer audits it under `Claim Audit` and `Contract Scope Audit`.
 
 ### `goal-tracker.md`
 
@@ -210,6 +244,55 @@ Minimum fields:
 - `reviewer_model`
 
 Purpose: make reviewer output machine-readable while preserving the original markdown. `PACT_STOP` and `PACT_CONTINUE` are deprecated compatibility tokens and parse as `continue`.
+
+### `round-XX-verification.json` and `round-XX-verification.log`
+
+Worker-safe round verification.
+
+Minimum fields:
+
+- `schema`: `"pact-round-verification/v1"`
+- `round`
+- `command`
+- `source`: public/lightweight verification
+- `status`: `not_run`, `passed`, `failed`, `timeout`, or `infra_failed`
+- `applied`
+- `build_status`
+- `error_categories`
+- `failure_signature`
+- `patch_sha256`
+- `duration_ms`
+
+Purpose: record patch apply and public build/self-check facts for reviewer use. In LoLBench default mode these files must not contain hidden `pact-gate` output, `eval_tests.patch`, F2P/P2P counts, or Docker grade logs.
+
+### `final-hidden-gate-<suite>.json`, `final-hidden-gate-<suite>.log`, `final-hidden-gate-summary.json`, and `final-result.json`
+
+Reviewer-candidate final hidden scoring artifacts.
+
+Minimum fields:
+
+- `suite`
+- `status`
+- `applied`
+- `resolved`
+- `build_status`
+- `f2p`
+- `p2p`
+- `error_categories`
+- `failure_signature`
+- `diagnostic_signature`
+- `patch_sha256`
+- `duration_ms`
+
+Purpose: preserve LoLBench hidden final gate evidence for reports and human diagnosis. These artifacts are reviewer/report-only and are not copied into worker continuation packages. Hidden final failure stops the loop with `stop_reason=final_hidden_gate_failed`.
+
+### `round-XX-continuation-package.md/json`
+
+Worker-facing continuation input derived from review results, patch metadata, and public verification status.
+
+This file must be sanitized. It must not include raw verification log tails, `eval_tests.patch`, F2P/P2P details, hidden/eval suite details, final hidden gate details, Docker grade logs, benchmark harness paths, or benchmark command lines. Full verification and final hidden artifacts can still be saved for human/report consumers, but they are not default worker input.
+
+Purpose: make each fresh worker round self-contained without leaking benchmark-only or hidden-eval details.
 
 ### `round-XX-result.json`
 
@@ -243,6 +326,9 @@ v1 failure categories:
 - `malformed_patch`
 - `patch_apply_failed`
 - `build_test_failed`
+- `build_gate_failed`
+- `max_rounds_without_build_success`
+- `verification_timeout`
 - `agent_timeout`
 - `max_rounds`
 - `cancelled`
@@ -256,6 +342,10 @@ Minimum metrics:
 - `changed_file_count`
 - `tool_event_count`
 - `review_marker`
+- `next_round`
+- `attempted_worker_rounds`
+- `completed_worker_rounds`
+- `reviewed_worker_rounds`
 
 Purpose: give LoLBench-style runs a consistent failure and metric row.
 
@@ -288,8 +378,10 @@ Purpose: freeze a checkpoint so later work can repeat it N times or compare mech
 - Worker attribution default for LoLBench smoke: `worker_backend=opencode-cli`, `worker_model=zai-coding-plan/glm-5-turbo`, `worker_config_source=mini-swe-agent-env`.
 - LoLBench smoke loads `~/Library/Application Support/mini-swe-agent/.env` and injects a custom OpenAI-compatible provider named `zai-coding-plan` with `baseURL={env:ZAI_API_BASE}` and `apiKey={env:ZAI_API_KEY}`. Secrets are referenced by env placeholder and are not written into artifacts.
 - LoLBench smoke should use `.opencode/plugins/pact/pact-run-driver.ts` rather than a single `opencode run` invocation. The driver starts a fresh OpenCode run per round by default, feeding `round-XX-prompt.md` while the PACT state remains `running`; same-session continuation is an explicit opt-in.
+- Optional LoLBench container-worker mode keeps the PACT driver on the host but runs each worker round through `docker run` inside an eval-derived agent image. Enable from LoLBench with `--pact-container-worker`, or call the driver with `--worker-runner docker` / `PACT_WORKER_RUNNER=docker`. The worker image is selected by `LOLBENCH_AGENT_IMAGE_TAG` unless `--worker-container-image` is explicit.
 - LoLBench smoke config enables `benchmarkStrictNetwork` by default; this blocks OpenCode `webfetch`, `websearch`, and obvious shell download attempts against feature-source hosts such as GitHub, python.org, and PyPI. True network isolation still requires LoLBench in-container execution or the host anti-cheat wrapper.
 - LoLBench host-mode `agent_timeout` marks active PACT loops stopped and archives `.pact` under the run directory for post-hoc inspection.
+- LoLBench `results.csv` reports stable public fields: image build status, agent status/timing, suite score, PACT loop path/status/phase/stop reason, `next_round`, attempted/completed/reviewed worker counters, first public build-success round, final hidden gate status/suites, and latest failure signature. Deprecated aliases and raw artifact debug refs are written to `results.verbose.csv`.
 - The smoke harness only maps mini-swe model names such as `zai/glm-4.7` to `zai-coding-plan/glm-4.7` when no explicit worker model is supplied.
 - Full alignment default: every 5 implementation rounds.
 - Codex planner and reviewer invocations run synchronously under the target project root using `cwd=<project_root>` and `-C <project_root>`.
