@@ -168,7 +168,21 @@ describe("artifact helpers", () => {
       f2p: { passed: 0, total: 3 },
       error_categories: ["build_failure"],
     })
-    expect(pkg.markdown).toContain("Remaining worker rounds: 2")
+    expect(pkg.markdown).toContain("# PACT Current State Snapshot")
+    expect(pkg.markdown).toContain("## Objective")
+    expect(pkg.markdown).toContain("## Acceptance Criteria Status")
+    expect(pkg.markdown).toContain("## Task State")
+    expect(pkg.markdown).toContain("## Reviewer Feedback To Incorporate")
+    expect(pkg.markdown).toContain("### Constraints")
+    expect(pkg.markdown).toContain("### Blockers")
+    expect(pkg.markdown).toContain("### Evidence")
+    expect(pkg.markdown).toContain("### Suggested Focus")
+    expect(pkg.markdown).toContain("## Open Items")
+    expect(pkg.markdown).toContain("## Current Workspace State")
+    expect(pkg.markdown).not.toContain("Worker rounds used")
+    expect(pkg.markdown).not.toContain("Remaining worker rounds")
+    expect(pkg.markdown).not.toContain("Patch SHA-256")
+    expect(pkg.markdown).not.toContain("## Next Worker Instruction")
     expect(pkg.markdown).not.toContain("Latest Verification Log Tail")
     expect(pkg.markdown).not.toContain("TestRecord.java:152")
     expect(pkg.markdown).not.toContain("eval_tests.patch")
@@ -176,7 +190,7 @@ describe("artifact helpers", () => {
     expect(pkg.markdown).not.toContain("P2P")
     expect(pkg.markdown).not.toContain("hidden eval")
     expect(pkg.markdown).not.toContain("lolbench_eval.py")
-    expect(pkg.markdown).toContain("Use the worker-safe continuation package and changed files to make workspace-only source changes")
+    expect(pkg.markdown).toContain("[redacted worker-unsafe benchmark/eval detail]")
     expect(JSON.parse(readFileSync(paths.continuationPackageJson, "utf-8"))).toMatchObject({
       schema: "pact-continuation-package/v1",
       round: 1,
@@ -807,9 +821,44 @@ describe("worker prompt shape", () => {
     expect(initial).toContain("when this bounded run ends")
   })
 
-  test("continuation prompts are self-contained round packages", () => {
+  test("continuation prompts inline current state and keep ultimate goal as the worker objective", () => {
     const project = tempProject()
     const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
+    const snapshot = `# PACT Current State Snapshot
+
+## Objective
+Complete the ultimate goal.
+
+## Acceptance Criteria Status
+| AC | Criterion | Current Status | Evidence So Far | Remaining Gaps |
+| --- | --- | --- | --- | --- |
+| AC-1 | Fix the bug | partial | src.txt changed | tests missing |
+
+## Task State
+| Task | Status | Evidence So Far | Remaining Work |
+| --- | --- | --- | --- |
+| task-1 | partial | patch exists | prove behavior |
+
+## Reviewer Feedback To Incorporate
+### Constraints
+- Preserve existing passing behavior.
+### Blockers
+- A source regression blocks AC-1.
+### Evidence
+- Reviewer accepted the source edit but not the tests.
+### Suggested Focus
+- Add focused regression coverage.
+
+This is guidance, not a replacement for the objective.
+
+## Open Items
+| Item | Blocks AC | Status | Notes |
+| --- | --- | --- | --- |
+| missing tests | AC-1 | open | add focused tests |
+
+## Current Workspace State
+- src.txt changed.
+`
     const prompt = buildContinuationPrompt({
       loopDir: loop.loopDir,
       round: 2,
@@ -819,18 +868,31 @@ describe("worker prompt shape", () => {
       planPath: join(loop.loopDir, "plan.md"),
       preSnapshotPath: join(loop.loopDir, "round-02-pre-snapshot.json"),
       cumulativePatchPath: join(loop.loopDir, "round-01-eval.patch"),
+      continuationPackageText: snapshot,
     })
 
+    expect(prompt).toContain("# PACT Round 02 Worker Prompt")
+    expect(prompt).toContain("## Objective")
+    expect(prompt).toContain("Complete the ultimate goal:")
+    expect(prompt).toContain("Satisfy all acceptance criteria below. Continue from the current workspace state.")
+    expect(prompt).toContain("## Current State Snapshot")
+    expect(prompt).toContain("### Suggested Focus")
+    expect(prompt).toContain("This is guidance, not a replacement for the objective.")
     expect(prompt).toContain("Plan:")
     expect(prompt).toContain("Todo:")
     expect(prompt).toContain("Goal tracker:")
     expect(prompt).not.toContain("Reviewer feedback:")
     expect(prompt).toContain("Pre-round snapshot:")
+    expect(prompt).toContain("Previous review feedback:")
     expect(prompt).not.toContain("Cumulative eval patch:")
-    expect(prompt).not.toContain("round-01-feedback.md")
+    expect(prompt).toContain("round-01-feedback.md")
     expect(prompt).not.toContain("round-01-eval.patch")
     expect(prompt).not.toContain("LoLBench")
+    expect(prompt).not.toContain("Worker rounds used")
+    expect(prompt).not.toContain("Patch SHA-256")
+    expect(prompt).not.toContain("## Next Worker Instruction")
     expect(prompt).toContain("write an honest summary")
+    expect(prompt).toContain("In the contract, choose your own smallest coherent plan for advancing the objective, considering reviewer feedback.")
   })
 
   test("continuation package translates benchmark-owned patch and gate feedback into workspace-only work", () => {

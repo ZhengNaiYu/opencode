@@ -121,6 +121,20 @@ describe("PACT run driver", () => {
     expect(parsed.model).toBe("zai-coding-plan/glm-5-turbo")
   })
 
+  test("parses planner and reviewer models from CLI", () => {
+    const parsed = cliArgs([
+      "--plan-file",
+      "/tmp/PROMPT.md",
+      "--planner-model",
+      "gpt-5.5",
+      "--reviewer-model",
+      "gpt-5.5",
+    ])
+
+    expect(parsed.plannerModel).toBe("gpt-5.5")
+    expect(parsed.reviewerModel).toBe("gpt-5.5")
+  })
+
   test("defaults worker runner from PACT env", () => {
     const oldRunner = process.env.PACT_WORKER_RUNNER
     const oldImage = process.env.LOLBENCH_AGENT_IMAGE_TAG
@@ -376,11 +390,13 @@ Continue source changes.
     const oldConfig = process.env.OPENCODE_CONFIG_CONTENT
     const oldZaiKey = process.env.ZAI_API_KEY
     const oldZaiBase = process.env.ZAI_API_BASE
+    const oldOpencodeConfig = process.env.OPENCODE_CONFIG
     const oldMem = process.env.LOLBENCH_MEM
     const oldCpus = process.env.LOLBENCH_CPUS
     process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ plugin: [pluginPath] })
     process.env.ZAI_API_KEY = "test-zai-key"
     process.env.ZAI_API_BASE = "https://api.z.ai/api/coding/paas/v4"
+    process.env.OPENCODE_CONFIG = "/root/.config/opencode/opencode.json"
     process.env.LOLBENCH_MEM = "7g"
     process.env.LOLBENCH_CPUS = "4"
     const calls: Array<{ command: string; args: string[]; input: string }> = []
@@ -416,11 +432,16 @@ Continue source changes.
       expect(calls[0]?.args).toContain("7g")
       expect(calls[0]?.args).toContain("--cpus")
       expect(calls[0]?.args).toContain("4")
+      expect(calls[0]?.args).toContain("api.github.com:127.0.0.1")
       expect(calls[0]?.args).toContain("lolbench/cpython-agent:1")
       expect(calls[0]?.args).toContain("-v")
       expect(calls[0]?.args).toContain(`${project}:/workspace/pact-workspace`)
       expect(calls[0]?.args).toContain(`${pluginDir}:/opt/opencode-pact-plugins:ro`)
+      const entrypointIndex = calls[0]!.args.indexOf("--entrypoint")
+      expect(entrypointIndex).toBeGreaterThan(-1)
+      expect(calls[0]?.args[entrypointIndex + 1]).toBe("")
       expect(calls[0]?.args).toContain("ZAI_API_KEY")
+      expect(calls[0]?.args).toContain("OPENCODE_CONFIG")
       const configArg = calls[0]?.args.find((arg) => arg.startsWith("OPENCODE_CONFIG_CONTENT=")) ?? ""
       expect(configArg).toContain("/opt/opencode-pact-plugins/pact.ts")
       expect(configArg).not.toContain(pluginDir)
@@ -440,6 +461,8 @@ Continue source changes.
       else process.env.ZAI_API_KEY = oldZaiKey
       if (oldZaiBase === undefined) delete process.env.ZAI_API_BASE
       else process.env.ZAI_API_BASE = oldZaiBase
+      if (oldOpencodeConfig === undefined) delete process.env.OPENCODE_CONFIG
+      else process.env.OPENCODE_CONFIG = oldOpencodeConfig
       if (oldMem === undefined) delete process.env.LOLBENCH_MEM
       else process.env.LOLBENCH_MEM = oldMem
       if (oldCpus === undefined) delete process.env.LOLBENCH_CPUS
@@ -453,8 +476,13 @@ Continue source changes.
     tempDirs.push(binDir)
     const oldPath = process.env.PATH
     const plannerOutputPath = join(binDir, "planner-output.txt")
+    const plannerArgsPath = join(binDir, "planner-args.txt")
     writeFileSync(plannerOutputPath, validPlannerOutput(), "utf-8")
-    writeFileSync(join(binDir, "codex"), `#!/bin/sh\ncat >/dev/null\ncat ${JSON.stringify(plannerOutputPath)}\n`, "utf-8")
+    writeFileSync(
+      join(binDir, "codex"),
+      `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(plannerArgsPath)}\ncat >/dev/null\ncat ${JSON.stringify(plannerOutputPath)}\n`,
+      "utf-8",
+    )
     chmodSync(join(binDir, "codex"), 0o755)
     process.env.PATH = `${binDir}:${oldPath ?? ""}`
     try {
@@ -482,6 +510,9 @@ Continue.
       expect(calls).toHaveLength(1)
       expect(calls[0]?.input).toContain("# PACT Round 01")
       expect(readFileSync(join(result.loopDir!, "round-00-plan-output.md"), "utf-8")).toContain("<<<PACT_PLAN>>>")
+      const plannerArgs = readFileSync(plannerArgsPath, "utf-8").split("\n")
+      expect(plannerArgs).toContain("--sandbox")
+      expect(plannerArgs).toContain("read-only")
       const state = readState(result.loopDir!)
       expect(state.stop_reason).toBe("max_rounds")
       expect(readFileSync(join(result.loopDir!, "round-01-result.json"), "utf-8")).toContain(
@@ -535,7 +566,8 @@ Continue from the source diff and fix the remaining mainline gap.
     expect(existsSync(join(loopDir, "round-01-review-decision.json"))).toBe(true)
     expect(existsSync(join(loopDir, "round-01-result.json"))).toBe(true)
     expect(existsSync(join(loopDir, "round-02-prompt.md"))).toBe(true)
-    expect(readFileSync(join(loopDir, "round-02-prompt.md"), "utf-8")).toContain("Current Round Package Summary")
+    expect(readFileSync(join(loopDir, "round-02-prompt.md"), "utf-8")).toContain("# PACT Round 02 Worker Prompt")
+    expect(readFileSync(join(loopDir, "round-02-prompt.md"), "utf-8")).toContain("## Current State Snapshot")
     expect(readFileSync(join(loopDir, "round-01-trajectory.json"), "utf-8")).toContain("worker exited without idle review")
   })
 

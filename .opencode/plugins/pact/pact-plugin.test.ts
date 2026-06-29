@@ -535,7 +535,8 @@ describe("PACT Codex planner and reviewer", () => {
     expect(packageText).not.toContain("eval_tests.patch")
     expect(packageText).not.toContain("Latest Verification Log Tail")
     expect(packageText).toContain("Use the worker-safe continuation package and changed files to make workspace-only source changes")
-    expect(readFileSync(join(loop.loopDir, "round-02-prompt.md"), "utf-8")).toContain("Current Round Package Summary")
+    expect(readFileSync(join(loop.loopDir, "round-02-prompt.md"), "utf-8")).toContain("# PACT Round 02 Worker Prompt")
+    expect(readFileSync(join(loop.loopDir, "round-02-prompt.md"), "utf-8")).toContain("## Current State Snapshot")
     expect(nextPrompt).not.toContain("TestRecord.java:152")
     expect(nextPrompt).not.toContain("F2P")
     expect(nextPrompt).not.toContain("P2P")
@@ -568,7 +569,7 @@ describe("PACT Codex planner and reviewer", () => {
     })
     expect(readFileSync(join(loop.loopDir, "round-01-feedback.md"), "utf-8")).toBe("Blocked but actionable.\n")
     expect(readState(loop.loopDir)).toMatchObject({ status: "running", phase: "implementation", current_round: 2 })
-    expect(readFileSync(join(loop.loopDir, "round-02-prompt.md"), "utf-8")).toContain("PACT Round 02 Continuation")
+    expect(readFileSync(join(loop.loopDir, "round-02-prompt.md"), "utf-8")).toContain("# PACT Round 02 Worker Prompt")
     expect(prompts).toEqual([])
 
     await hooks.event?.({ event: { type: "session.idle", properties: { sessionID: "ses_unrelated" } } as any })
@@ -773,7 +774,7 @@ describe("PACT Codex planner and reviewer", () => {
     expect(packageText).not.toContain("TestRecord.java:152")
     expect(packageText).not.toContain("Latest Verification Log Tail")
     expect(nextPrompt).not.toContain("TestRecord.java:152")
-    expect(nextPrompt).toContain("Current Round Package Summary")
+    expect(nextPrompt).toContain("## Current State Snapshot")
   })
 
   test("codex-cli reviewer failure writes reviewer_failed artifacts", async () => {

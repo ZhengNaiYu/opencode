@@ -1571,6 +1571,8 @@ function invokeDriverCodexPlanner(prompt: string, projectRoot: string, model: st
     "exec",
     "--ignore-user-config",
     "--skip-git-repo-check",
+    "--sandbox",
+    "read-only",
     "-m",
     model,
     "-c",
@@ -1598,6 +1600,8 @@ function invokeDriverCodexReviewer(prompt: string, projectRoot: string, model: s
     "exec",
     "--ignore-user-config",
     "--skip-git-repo-check",
+    "--sandbox",
+    "read-only",
     "-m",
     model,
     "-c",
@@ -1699,6 +1703,8 @@ function buildWorkerInvocation(input: {
     `${input.projectRoot}:${input.containerWorkspace}`,
     "-w",
     input.containerWorkspace,
+    "--entrypoint",
+    "",
   ]
   const envArgs = dockerWorkerEnvArgs(input)
   args.push(...envArgs)
@@ -1720,7 +1726,7 @@ function dockerWorkerEnvArgs(input: {
   workerContainerPluginMount: string
 }): string[] {
   const args: string[] = []
-  for (const name of ["ZAI_API_KEY", "ZAI_API_BASE", "MSWEA_MODEL_NAME"]) {
+  for (const name of ["ZAI_API_KEY", "ZAI_API_BASE", "OPENCODE_CONFIG", "MSWEA_MODEL_NAME"]) {
     if (env[name]) args.push("-e", name)
   }
   const config = containerOpenCodeConfig(input)
@@ -1754,6 +1760,7 @@ function inferredPluginMount(): string | undefined {
 function dockerBlackholeHostArgs(): string[] {
   const hosts = [
     "github.com",
+    "api.github.com",
     "raw.githubusercontent.com",
     "codeload.github.com",
     "gist.github.com",
@@ -1806,6 +1813,8 @@ export function cliArgs(raw: string[]): {
   workerContainerWorkspace?: string
   workerPluginMount?: string
   workerContainerPluginMount?: string
+  plannerModel?: string
+  reviewerModel?: string
   fullAlignmentInterval?: number
   sessionStrategy?: SessionStrategy
   verificationCommand?: string
@@ -1838,6 +1847,8 @@ export function cliArgs(raw: string[]): {
     workerContainerWorkspace: parsed["worker-container-workspace"],
     workerPluginMount: parsed["worker-plugin-mount"],
     workerContainerPluginMount: parsed["worker-container-plugin-mount"],
+    plannerModel: parsed["planner-model"],
+    reviewerModel: parsed["reviewer-model"],
     verificationCommand: defaultVerificationCommand(parsed),
     verificationTimeoutMs: parsed["verification-timeout-ms"] ? Number(parsed["verification-timeout-ms"]) : undefined,
     resumeLoopDir: parsed["resume-loop"] ?? env.PACT_RESUME_LOOP_DIR,

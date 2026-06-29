@@ -25,6 +25,9 @@ describe("LoLBench ZAI Coding Plan smoke config", () => {
             apiKey: "{env:ZAI_API_KEY}",
           },
           models: {
+            "glm-5.2": {
+              name: "GLM 5.2",
+            },
             "glm-5.1": {
               name: "GLM 5.1",
             },

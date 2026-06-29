@@ -1256,35 +1256,257 @@ export function writeContinuationPackage(input: {
         }
       : undefined,
   } satisfies ContinuationPackageArtifact)
-  const markdown = [
-    `# PACT Round ${roundName(input.round)} Continuation Package`,
-    "",
-    "## Current Round Package Summary",
-    `- Loop phase: ${input.loopPhase}`,
-    `- Worker rounds used: ${input.workerRoundCount}/${input.maxRounds}`,
-    `- Remaining worker rounds: ${remainingWorkerRounds}`,
-    input.patchSha256 ? `- Patch SHA-256: ${input.patchSha256}` : undefined,
-    input.changedFiles?.length ? `- Changed files: ${input.changedFiles.join(", ")}` : "- Changed files: (none)",
-    input.verification
-      ? `- Verification: ${input.verification.status}${input.verification.build_status ? ` / build=${input.verification.build_status}` : ""}`
-      : "- Verification: not run",
-    latestFailureSignature ? `- Latest failure signature: ${latestFailureSignature}` : undefined,
-    "",
-    "## Latest Reviewer Findings",
-    compactReviewFindings(input.reviewText ?? "") || "(none)",
-    "",
-    "## Worker Boundary",
-    "Do not modify PACT artifacts or run gates. Make workspace-only source changes; PACT will recapture patches and run verification after the round.",
-    "",
-    "## Next Worker Instruction",
-    nextWorkerInstruction || "(none)",
-    "",
-  ]
-    .filter((line): line is string => line !== undefined)
-    .join("\n")
+  const markdown = buildCurrentStateSnapshot({
+    loopDir: input.loopDir,
+    reviewText: input.reviewText,
+    changedFiles: input.changedFiles ?? [],
+    suggestedFocus: nextWorkerInstruction,
+  })
   writeJsonFile(paths.continuationPackageJson, artifact)
   writeFileSync(paths.continuationPackage, markdown, "utf-8")
   return { artifact, markdown }
+}
+
+function buildCurrentStateSnapshot(input: {
+  loopDir: string
+  reviewText?: string
+  changedFiles?: string[]
+  suggestedFocus?: string
+}): string {
+  const planPath = join(input.loopDir, "plan.md")
+  const todoPath = join(input.loopDir, "todo.md")
+  const goalTrackerPath = join(input.loopDir, "goal-tracker.md")
+  const planText = existsSync(planPath) ? readFileSync(planPath, "utf-8") : ""
+  const todoText = existsSync(todoPath) ? readFileSync(todoPath, "utf-8") : ""
+  const goalTrackerText = existsSync(goalTrackerPath) ? readFileSync(goalTrackerPath, "utf-8") : ""
+  const reviewerFeedback = reviewerFeedbackSnapshot(input.reviewText ?? "", input.suggestedFocus)
+
+  return [
+    "# PACT Current State Snapshot",
+    "",
+    "## Objective",
+    snapshotObjective(input.loopDir),
+    "",
+    "## Acceptance Criteria Status",
+    acceptanceCriteriaStatusSnapshot(goalTrackerText, planText),
+    "",
+    "## Task State",
+    taskStateSnapshot(goalTrackerText, todoText),
+    "",
+    "## Reviewer Feedback To Incorporate",
+    "### Constraints",
+    reviewerFeedback.constraints,
+    "",
+    "### Blockers",
+    reviewerFeedback.blockers,
+    "",
+    "### Evidence",
+    reviewerFeedback.evidence,
+    "",
+    "### Suggested Focus",
+    reviewerFeedback.suggestedFocus,
+    "",
+    "## Open Items",
+    openItemsSnapshot(goalTrackerText),
+    "",
+    "## Current Workspace State",
+    workspaceStateSnapshot(input.changedFiles ?? []),
+    "",
+  ].join("\n")
+}
+
+function snapshotObjective(loopDir: string, planPath?: string): string {
+  const goalTrackerPath = join(loopDir, "goal-tracker.md")
+  const goalTrackerText = existsSync(goalTrackerPath) ? readFileSync(goalTrackerPath, "utf-8") : ""
+  const planText = existsSync(planPath ?? join(loopDir, "plan.md"))
+    ? readFileSync(planPath ?? join(loopDir, "plan.md"), "utf-8")
+    : ""
+  return (
+    sanitizeSnapshotBlock(extractMarkdownSection(goalTrackerText, "Ultimate Goal") ?? "") ||
+    sanitizeSnapshotBlock(extractMarkdownSection(planText, "Goal Description") ?? "") ||
+    sanitizeSnapshotBlock(extractFirstUsefulPlanLine(planText) ?? "") ||
+    "Execute the current PACT plan."
+  )
+}
+
+function acceptanceCriteriaStatusSnapshot(goalTrackerText: string, planText: string): string {
+  const section =
+    extractMarkdownSection(goalTrackerText, "Acceptance Criteria") ??
+    extractMarkdownSection(planText, "Acceptance Criteria") ??
+    ""
+  const rows = markdownTableRows(section)
+  const dataRows = rows.filter((row) => /^AC-\d+(?:\.\d+)?$/i.test(row[0]?.trim() ?? ""))
+  const evidenceByAC = completedEvidenceByAC(goalTrackerText)
+  const outputRows = dataRows.map((row) => {
+    const ac = row[0]?.trim() || "AC-1"
+    const criterion = row[1]?.trim() || "Current acceptance criterion"
+    const status = row[4]?.trim() || row[2]?.trim() || "pending"
+    const evidence = evidenceByAC.get(ac) ?? "-"
+    const remainingGaps = /\b(?:complete|verified|done|resolved|passed)\b/i.test(status)
+      ? "none recorded"
+      : "See reviewer feedback, open items, and remaining task work."
+    return `| ${escapeTableCell(ac)} | ${escapeTableCell(sanitizeSnapshotBlock(criterion))} | ${escapeTableCell(sanitizeSnapshotBlock(status))} | ${escapeTableCell(sanitizeSnapshotBlock(evidence))} | ${escapeTableCell(sanitizeSnapshotBlock(remainingGaps))} |`
+  })
+
+  return [
+    "| AC | Criterion | Current Status | Evidence So Far | Remaining Gaps |",
+    "| --- | --- | --- | --- | --- |",
+    ...(outputRows.length
+      ? outputRows
+      : ["| AC-1 | Current plan requirements | pending | - | Read plan.md and goal-tracker.md. |"]),
+  ].join("\n")
+}
+
+function taskStateSnapshot(goalTrackerText: string, todoText: string): string {
+  const todoRows = markdownTableRows(todoText).filter((row) => /^task-\d+/i.test(row[0]?.trim() ?? ""))
+  const activeRows = markdownTableRows(extractMarkdownSection(goalTrackerText, "Active Tasks") ?? "").filter((row) =>
+    /^task-\d+/i.test(row[0]?.trim() ?? ""),
+  )
+  const rows = todoRows.length ? todoRows : activeRows
+  const evidenceByTask = completedEvidenceByTask(goalTrackerText)
+  const outputRows = rows.map((row) => {
+    const task = row[0]?.trim() || "task-1"
+    const fromTodo = todoRows.length > 0
+    const description = fromTodo ? row[1]?.trim() || task : row[5]?.trim() || task
+    const status = fromTodo ? row[5]?.trim() || "pending" : row[2]?.trim() || "pending"
+    const evidence = evidenceByTask.get(task) ?? "-"
+    const remainingWork = /\b(?:complete|verified|done|resolved|passed)\b/i.test(status)
+      ? "none"
+      : description || "Continue this task."
+    return `| ${escapeTableCell(task)} | ${escapeTableCell(sanitizeSnapshotBlock(status))} | ${escapeTableCell(sanitizeSnapshotBlock(evidence))} | ${escapeTableCell(sanitizeSnapshotBlock(remainingWork))} |`
+  })
+
+  return [
+    "| Task | Status | Evidence So Far | Remaining Work |",
+    "| --- | --- | --- | --- |",
+    ...(outputRows.length
+      ? outputRows
+      : ["| task-1 | pending | - | Choose the smallest coherent next step toward the objective. |"]),
+  ].join("\n")
+}
+
+function reviewerFeedbackSnapshot(
+  reviewText: string,
+  suggestedFocus: string | undefined,
+): { constraints: string; blockers: string; evidence: string; suggestedFocus: string } {
+  const safeSuggestedFocus = sanitizeSnapshotBlock(suggestedFocus ?? "")
+  const constraints = bulletList([
+    "Do not modify PACT artifacts or run gates; make workspace-only source changes.",
+    sanitizeSnapshotBlock(extractMarkdownSection(reviewText, "Constraints") ?? ""),
+  ])
+  const blockers = bulletList([
+    sanitizeSnapshotBlock(extractMarkdownSection(reviewText, "Findings") ?? ""),
+    sanitizeSnapshotBlock(extractMarkdownSection(reviewText, "Blocking Side Issues") ?? ""),
+    sanitizeSnapshotBlock(extractMarkdownSection(reviewText, "Acceptance Criteria Audit") ?? ""),
+  ])
+  const evidence = bulletList([
+    sanitizeSnapshotBlock(extractMarkdownSection(reviewText, "Claim Audit") ?? ""),
+    sanitizeSnapshotBlock(extractMarkdownSection(reviewText, "Public Verification Gate") ?? ""),
+    sanitizeSnapshotBlock(extractMarkdownSection(reviewText, "Goal Alignment Summary") ?? ""),
+  ])
+  const focusBody = safeSuggestedFocus
+    ? `${safeSuggestedFocus}\n\nThis is guidance, not a replacement for the objective.`
+    : "(none identified)\n\nThis is guidance, not a replacement for the objective."
+  return {
+    constraints,
+    blockers,
+    evidence,
+    suggestedFocus: focusBody,
+  }
+}
+
+function openItemsSnapshot(goalTrackerText: string): string {
+  const openIssueRows = markdownTableRows(extractMarkdownSection(goalTrackerText, "Open Issues") ?? "").filter((row) =>
+    row.some((cell) => cell.trim()),
+  )
+  const deferredRows = markdownTableRows(extractMarkdownSection(goalTrackerText, "Explicitly Deferred") ?? "").filter((row) =>
+    row.some((cell) => cell.trim()),
+  )
+  const outputRows = [
+    ...openIssueRows.map((row) => {
+      const item = row[0]?.trim() || "open issue"
+      const round = row[1]?.trim() || "-"
+      const blocksAC = row[2]?.trim() || "-"
+      const notes = row[3]?.trim() || "-"
+      return `| ${escapeTableCell(sanitizeSnapshotBlock(item))} | ${escapeTableCell(sanitizeSnapshotBlock(blocksAC))} | ${escapeTableCell(sanitizeSnapshotBlock(`open since ${round}`))} | ${escapeTableCell(sanitizeSnapshotBlock(notes))} |`
+    }),
+    ...deferredRows.map((row) => {
+      const item = row[0]?.trim() || "deferred item"
+      const blocksAC = row[1]?.trim() || "-"
+      const since = row[2]?.trim() || "-"
+      const notes = [row[3], row[4]].filter(Boolean).join("; ") || "-"
+      return `| ${escapeTableCell(sanitizeSnapshotBlock(item))} | ${escapeTableCell(sanitizeSnapshotBlock(blocksAC))} | ${escapeTableCell(sanitizeSnapshotBlock(`deferred since ${since}`))} | ${escapeTableCell(sanitizeSnapshotBlock(notes))} |`
+    }),
+  ]
+  return [
+    "| Item | Blocks AC | Status | Notes |",
+    "| --- | --- | --- | --- |",
+    ...(outputRows.length ? outputRows : ["| (none recorded) | - | - | - |"]),
+  ].join("\n")
+}
+
+function workspaceStateSnapshot(changedFiles: string[]): string {
+  const safeFiles = changedFiles
+    .map((filePath) => sanitizeSnapshotBlock(filePath))
+    .filter((filePath) => filePath && !isWorkerUnsafeLine(filePath))
+    .slice(0, 25)
+  if (!safeFiles.length) {
+    return "- No changed files were recorded in the latest worker snapshot."
+  }
+  return ["- Changed workspace files to inspect for current behavior:", ...safeFiles.map((filePath) => `  - ${filePath}`)].join(
+    "\n",
+  )
+}
+
+function markdownTableRows(markdown: string): string[][] {
+  const rows = markdown
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("|") && line.endsWith("|"))
+    .map((line) => line.slice(1, -1).split("|").map((cell) => cell.trim()))
+    .filter((row) => !isMarkdownSeparatorRow(row))
+  if (rows.length > 1 && !/^AC-\d+|^task-\d+/i.test(rows[0]?.[0] ?? "")) return rows.slice(1)
+  return rows
+}
+
+function isMarkdownSeparatorRow(row: string[]): boolean {
+  return row.every((cell) => /^:?-{3,}:?$/.test(cell.trim()))
+}
+
+function completedEvidenceByAC(goalTrackerText: string): Map<string, string> {
+  const rows = markdownTableRows(extractMarkdownSection(goalTrackerText, "Completed and Verified") ?? "")
+  const evidence = new Map<string, string>()
+  for (const row of rows) {
+    const ac = row[0]?.trim()
+    const value = row[4]?.trim()
+    if (ac && value) evidence.set(ac, value)
+  }
+  return evidence
+}
+
+function completedEvidenceByTask(goalTrackerText: string): Map<string, string> {
+  const rows = markdownTableRows(extractMarkdownSection(goalTrackerText, "Completed and Verified") ?? "")
+  const evidence = new Map<string, string>()
+  for (const row of rows) {
+    const task = row[1]?.trim()
+    const value = row[4]?.trim()
+    if (task && value) evidence.set(task, value)
+  }
+  return evidence
+}
+
+function bulletList(items: string[]): string {
+  const bullets = items
+    .flatMap((item) => item.split(/\r?\n/))
+    .map((line) => line.replace(/^[-*]\s+/, "").trim())
+    .filter(Boolean)
+    .slice(0, 20)
+    .map((line) => `- ${line}`)
+  return bullets.length ? bullets.join("\n") : "- (none identified)"
+}
+
+function sanitizeSnapshotBlock(text: string): string {
+  return sanitizeWorkerFacingText(text).slice(0, 2000).trim()
 }
 
 export function exportReplayCase(input: {
@@ -1891,14 +2113,22 @@ export function buildInitialWorkerPrompt(input: {
   todoPath: string
   goalTrackerPath: string
 }): string {
-  return `# PACT Round ${roundName(input.round)}
+  const snapshot = buildCurrentStateSnapshot({
+    loopDir: input.loopDir,
+    changedFiles: [],
+  })
+  return `# PACT Round ${roundName(input.round)} Worker Prompt
 
-You are the PACT worker. This is one bounded run.
+## Objective
+Complete the ultimate goal:
+${snapshotObjective(input.loopDir)}
 
-Read:
-- Plan: ${join(input.loopDir, "plan.md")}
-- Todo: ${input.todoPath}
-- Goal tracker: ${input.goalTrackerPath}
+Satisfy all acceptance criteria below. Continue from the current workspace state.
+
+## Current State Snapshot
+${snapshot}
+
+## Required Process
 
 First action: write ${join(input.loopDir, `round-${roundName(input.round)}-contract.md`)} with:
 - single mainline objective
@@ -1921,6 +2151,13 @@ Rules:
 - If goal tracker or todo ledger updates are needed, include a "Goal Tracker / Ledger Update Request" section in your summary.
 - Before stopping, write an honest summary to ${join(input.loopDir, `round-${roundName(input.round)}-summary.md`)}.
 - After writing the summary, stop work and return control to PACT. Do not keep coding, testing, or editing after the summary is written.
+- Do not use web/code-host lookup.
+
+## Reference Files
+- Plan: ${join(input.loopDir, "plan.md")}
+- Todo: ${input.todoPath}
+- Goal tracker: ${input.goalTrackerPath}
+- Pre-round snapshot: ${artifactPaths(input.loopDir, input.round).preSnapshot}
 
 The reviewer will inspect your summary and the repository state when this bounded run ends.
 `
@@ -1943,25 +2180,28 @@ export function buildContinuationPrompt(input: {
     (input.continuationPackagePath && existsSync(input.continuationPackagePath)
       ? readFileSync(input.continuationPackagePath, "utf-8")
       : undefined)
-  return `# PACT Round ${roundName(input.round)} Continuation
+  const snapshot =
+    packageText ??
+    buildCurrentStateSnapshot({
+      loopDir: input.loopDir,
+      changedFiles: [],
+    })
+  return `# PACT Round ${roundName(input.round)} Worker Prompt
 
 The previous round did not pass review.
 
 This prompt is self-contained for a fresh worker session. Do not rely on prior chat context.
 
-${packageText ? `## Current Round Package Summary\n${packageText.trim()}\n` : ""}
+## Objective
+Complete the ultimate goal:
+${snapshotObjective(input.loopDir, input.planPath)}
 
-Read this round package:
-- Plan: ${input.planPath ?? join(input.loopDir, "plan.md")}
-- Todo: ${input.todoPath ?? join(input.loopDir, "todo.md")}
-- Goal tracker: ${input.goalTrackerPath}
-- Continuation package: ${input.continuationPackagePath ?? artifactPaths(input.loopDir, Math.max(1, input.round - 1)).continuationPackage}
-- Pre-round snapshot: ${input.preSnapshotPath ?? artifactPaths(input.loopDir, input.round).preSnapshot}
+Satisfy all acceptance criteria below. Continue from the current workspace state.
 
-Address the worker-safe continuation package with the smallest necessary source changes. Before stopping, write an honest summary to ${join(
-    input.loopDir,
-    `round-${roundName(input.round)}-summary.md`,
-  )}.
+## Current State Snapshot
+${snapshot.trim()}
+
+## Required Process
 
 First action: write ${join(input.loopDir, `round-${roundName(input.round)}-contract.md`)} with:
 - single mainline objective
@@ -1970,15 +2210,32 @@ First action: write ${join(input.loopDir, `round-${roundName(input.round)}-contr
 - queued out-of-scope issues
 - success criteria
 
+In the contract, choose your own smallest coherent plan for advancing the objective, considering reviewer feedback.
 Do not edit source files, run tests, or inspect unrelated files before this contract exists. Missing contract is a reviewer-blocking defect.
 
+Before stopping, write an honest summary to ${join(input.loopDir, `round-${roundName(input.round)}-summary.md`)}.
+Summary must explain:
+- what ACs/tasks you advanced
+- what reviewer feedback you addressed
+- what remains
+- what was tested
+
+After writing the summary, stop work and return control to PACT. Do not keep coding, testing, or editing after the summary is written.
 Do not use Task/subagent delegation; do the work in this session so PACT can observe and replay the round.
 Do not create or edit external validation-owned patch files; PACT owns patch export.
 Do not run external validation gates or validation-owned commands; PACT runs verification after the round.
 Do not stage, reset, commit, stash, or otherwise manage git index state.
 Do not directly edit todo.md, plan.md, source-plan.md, review artifacts, result artifacts, state artifacts, or replay artifacts.
 If goal tracker or todo ledger updates are needed, include a "Goal Tracker / Ledger Update Request" section in your summary instead of editing ledgers directly.
-After writing the summary, stop work and return control to PACT. Do not keep coding, testing, or editing after the summary is written.
+Do not use web/code-host lookup.
+
+## Reference Files
+- Plan: ${input.planPath ?? join(input.loopDir, "plan.md")}
+- Todo: ${input.todoPath ?? join(input.loopDir, "todo.md")}
+- Goal tracker: ${input.goalTrackerPath}
+- Continuation package: ${input.continuationPackagePath ?? artifactPaths(input.loopDir, Math.max(1, input.round - 1)).continuationPackage}
+- Pre-round snapshot: ${input.preSnapshotPath ?? artifactPaths(input.loopDir, input.round).preSnapshot}
+- Previous review feedback: ${input.feedbackPath}
 `
 }
 
@@ -2663,11 +2920,6 @@ function mentionsHarnessOwnedWork(text: string): boolean {
     /\beval patch\b[\s\S]*\bincremental delta\b/i.test(text) ||
     /\beval failure\b/i.test(text) ||
     /\b(?:workspace_patch|eval_patch|patch-artifact|solution\.patch|test\.patch|lolbench_eval\.py)\b/i.test(text)
-}
-
-function compactReviewFindings(text: string): string {
-  const findings = /### Findings\s*([\s\S]*?)(?:\n### |\nPACT_COMPLETE\s*$|$)/i.exec(text)?.[1]
-  return sanitizeWorkerFacingText(findings ?? text).slice(0, 2000)
 }
 
 export function sanitizeWorkerFacingText(text: string): string {
