@@ -546,8 +546,23 @@ Continue.
         return `### Decision Summary
 Needs another round.
 
-### Next Worker Instructions
-Continue from the source diff and fix the remaining mainline gap.
+### Goal Alignment Summary
+ACs: 0/1 addressed | Forgotten items: 0 | Unjustified deferrals: 0
+
+### Progress Audit
+- The source change is only partially complete.
+
+### Acceptance Criteria Audit
+AC-1: PARTIAL.
+
+### Unresolved Mainline Gaps
+- Source behavior still needs the mainline fix.
+
+### Defects and Regressions
+(none)
+
+### Suggested Priorities
+- Inspect src.txt and complete the source behavior fix; this is advisory, not assignment.
 `
       },
       spawnSync(command, args, options) {
@@ -566,8 +581,20 @@ Continue from the source diff and fix the remaining mainline gap.
     expect(existsSync(join(loopDir, "round-01-review-decision.json"))).toBe(true)
     expect(existsSync(join(loopDir, "round-01-result.json"))).toBe(true)
     expect(existsSync(join(loopDir, "round-02-prompt.md"))).toBe(true)
-    expect(readFileSync(join(loopDir, "round-02-prompt.md"), "utf-8")).toContain("# PACT Round 02 Worker Prompt")
-    expect(readFileSync(join(loopDir, "round-02-prompt.md"), "utf-8")).toContain("## Current State Snapshot")
+    const reviewDecision = JSON.parse(readFileSync(join(loopDir, "round-01-review-decision.json"), "utf-8"))
+    expect(reviewDecision.review_guidance).toMatchObject({
+      role: "advisory",
+      suggestedPriorities: expect.stringContaining("Inspect src.txt"),
+    })
+    expect(reviewDecision).not.toHaveProperty("next_worker_instruction")
+    const roundTwoPrompt = readFileSync(join(loopDir, "round-02-prompt.md"), "utf-8")
+    expect(roundTwoPrompt).toContain("# PACT Round 02 Worker Prompt")
+    expect(roundTwoPrompt).toContain("## Current State Snapshot")
+    expect(roundTwoPrompt).toContain("Reviewer guidance is evidence, not assignment")
+    expect(roundTwoPrompt).toContain("### Suggested Priorities")
+    expect(roundTwoPrompt).toContain("Inspect src.txt")
+    expect(roundTwoPrompt).toContain("make as much correct progress toward the Ultimate Goal")
+    expect(roundTwoPrompt).not.toContain("## Next Worker Instruction")
     expect(readFileSync(join(loopDir, "round-01-trajectory.json"), "utf-8")).toContain("worker exited without idle review")
   })
 

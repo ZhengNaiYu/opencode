@@ -172,11 +172,9 @@ describe("artifact helpers", () => {
     expect(pkg.markdown).toContain("## Objective")
     expect(pkg.markdown).toContain("## Acceptance Criteria Status")
     expect(pkg.markdown).toContain("## Task State")
-    expect(pkg.markdown).toContain("## Reviewer Feedback To Incorporate")
-    expect(pkg.markdown).toContain("### Constraints")
-    expect(pkg.markdown).toContain("### Blockers")
-    expect(pkg.markdown).toContain("### Evidence")
-    expect(pkg.markdown).toContain("### Suggested Focus")
+    expect(pkg.markdown).toContain("## Reviewer Guidance To Incorporate")
+    expect(pkg.markdown).toContain("Reviewer guidance is evidence, not assignment")
+    expect(pkg.markdown).toContain("### Suggested Priorities")
     expect(pkg.markdown).toContain("## Open Items")
     expect(pkg.markdown).toContain("## Current Workspace State")
     expect(pkg.markdown).not.toContain("Worker rounds used")
@@ -195,8 +193,15 @@ describe("artifact helpers", () => {
       schema: "pact-continuation-package/v1",
       round: 1,
       next_round: 2,
+      review_guidance: {
+        role: "advisory",
+        defectsAndRegressions: expect.stringContaining("[redacted worker-unsafe benchmark/eval detail]"),
+      },
       verification: { status: "failed", build_status: "failed" },
     })
+    expect(JSON.parse(readFileSync(paths.continuationPackageJson, "utf-8"))).not.toHaveProperty(
+      "next_worker_instruction",
+    )
   })
 })
 
@@ -636,7 +641,7 @@ Fix the bug.
       "| AC-1 | task-1 | 2 | 2 | tests pass. |",
     )
     expect(readFileSync(join(loop.loopDir, "goal-tracker.md"), "utf-8")).toContain(
-      "| task-1 | AC-1 | complete | coding | worker | Implement the smallest coherent checkpoint. |",
+      "| task-1 | AC-1 | complete | coding | worker | Implement a coherent objective toward the Ultimate Goal. |",
     )
   })
 
@@ -839,17 +844,21 @@ Complete the ultimate goal.
 | --- | --- | --- | --- |
 | task-1 | partial | patch exists | prove behavior |
 
-## Reviewer Feedback To Incorporate
-### Constraints
-- Preserve existing passing behavior.
-### Blockers
-- A source regression blocks AC-1.
-### Evidence
-- Reviewer accepted the source edit but not the tests.
-### Suggested Focus
-- Add focused regression coverage.
+## Reviewer Guidance To Incorporate
+Reviewer guidance is evidence, not assignment. Use it with the Ultimate Goal, unfinished ACs/tasks, and current state when writing the next round contract.
 
-This is guidance, not a replacement for the objective.
+### Goal Alignment Summary
+- ACs: 1/2 addressed | Forgotten items: 1 | Unjustified deferrals: 0
+### Progress Audit
+- AC-1 is partial.
+### Acceptance Criteria Audit
+- AC-1: PARTIAL.
+### Unresolved Mainline Gaps
+- Tests remain missing.
+### Defects and Regressions
+- A source regression blocks AC-1.
+### Suggested Priorities
+- Add focused regression coverage.
 
 ## Open Items
 | Item | Blocks AC | Status | Notes |
@@ -876,8 +885,8 @@ This is guidance, not a replacement for the objective.
     expect(prompt).toContain("Complete the ultimate goal:")
     expect(prompt).toContain("Satisfy all acceptance criteria below. Continue from the current workspace state.")
     expect(prompt).toContain("## Current State Snapshot")
-    expect(prompt).toContain("### Suggested Focus")
-    expect(prompt).toContain("This is guidance, not a replacement for the objective.")
+    expect(prompt).toContain("### Suggested Priorities")
+    expect(prompt).toContain("Reviewer guidance is evidence, not assignment")
     expect(prompt).toContain("Plan:")
     expect(prompt).toContain("Todo:")
     expect(prompt).toContain("Goal tracker:")
@@ -892,7 +901,9 @@ This is guidance, not a replacement for the objective.
     expect(prompt).not.toContain("Patch SHA-256")
     expect(prompt).not.toContain("## Next Worker Instruction")
     expect(prompt).toContain("write an honest summary")
-    expect(prompt).toContain("In the contract, choose your own smallest coherent plan for advancing the objective, considering reviewer feedback.")
+    expect(prompt).toContain("make as much correct progress toward the Ultimate Goal as this bounded round allows")
+    expect(prompt).toContain("Prefer the broadest coherent objective")
+    expect(prompt).toContain("Treat reviewer feedback as evidence, not as an assignment")
   })
 
   test("continuation package translates benchmark-owned patch and gate feedback into workspace-only work", () => {
@@ -925,8 +936,10 @@ Regenerate the patch artifacts so the eval patch contains only the incremental d
 `,
     })
 
-    expect(artifact.next_worker_instruction).not.toContain("Regenerate the patch artifacts")
-    expect(artifact.next_worker_instruction).not.toContain("rerun the pact gate")
+    expect(artifact).not.toHaveProperty("next_worker_instruction")
+    expect(artifact.review_guidance?.suggestedPriorities).toContain("make workspace-only source changes")
+    expect(artifact.review_guidance?.suggestedPriorities).not.toContain("Regenerate the patch artifacts")
+    expect(artifact.review_guidance?.suggestedPriorities).not.toContain("pact gate")
     expect(markdown).not.toContain("Regenerate the patch artifacts")
     expect(markdown).not.toContain("rerun the pact gate")
     expect(markdown).not.toContain("eval_tests.patch")
@@ -1078,11 +1091,12 @@ Fix the starred-subscript unparse regression, the *args source-location regressi
 
     expect(artifact.latest_failure_signature).toBeUndefined()
     expect(markdown).not.toContain("Latest failure category: }")
-    expect(artifact.next_worker_instruction).toContain("Fix the starred-subscript unparse regression")
-    expect(artifact.next_worker_instruction).toContain("source-location regression")
-    expect(artifact.next_worker_instruction).toContain("future-annotations")
-    expect(artifact.next_worker_instruction).not.toContain("ForwardRef")
-    expect(artifact.next_worker_instruction).not.toContain("F2P")
+    expect(artifact).not.toHaveProperty("next_worker_instruction")
+    expect(artifact.review_guidance?.suggestedPriorities).toContain("Fix the starred-subscript unparse regression")
+    expect(artifact.review_guidance?.suggestedPriorities).toContain("source-location regression")
+    expect(artifact.review_guidance?.suggestedPriorities).toContain("future-annotations")
+    expect(artifact.review_guidance?.suggestedPriorities).not.toContain("ForwardRef")
+    expect(artifact.review_guidance?.suggestedPriorities).not.toContain("F2P")
     expect(markdown).toContain("Fix the starred-subscript unparse regression")
     expect(markdown).not.toContain("ForwardRef")
     expect(markdown).not.toContain("F2P")
@@ -1133,6 +1147,13 @@ describe("review prompt shape", () => {
     expect(prompt).toContain("### Claim Audit")
     expect(prompt).toContain("### Contract Scope Audit")
     expect(prompt).toContain("Mainline Gaps")
+    expect(prompt).toContain("### Progress Audit")
+    expect(prompt).toContain("### Unresolved Mainline Gaps")
+    expect(prompt).toContain("### Defects and Regressions")
+    expect(prompt).toContain("### Suggested Priorities")
+    expect(prompt).toContain("advisory")
+    expect(prompt).not.toContain("### Next Worker Instructions")
+    expect(prompt).not.toContain("next smallest checkpoint")
     expect(prompt).toContain("Blocking Side Issues")
     expect(prompt).toContain("Queued Side Issues")
   })
@@ -1518,7 +1539,29 @@ describe("recordReviewDecision", () => {
     recordReviewDecision({
       loopDir: loop.loopDir,
       round: 1,
-      reviewText: "Looks good.\nPACT_COMPLETE\n",
+      reviewText: `### Decision Summary
+Looks good.
+
+### Goal Alignment Summary
+ACs: 1/1 addressed | Forgotten items: 0 | Unjustified deferrals: 0
+
+### Progress Audit
+- task-1 is complete.
+
+### Acceptance Criteria Audit
+AC-1: MET.
+
+### Unresolved Mainline Gaps
+(none)
+
+### Defects and Regressions
+(none)
+
+### Suggested Priorities
+- Enter review phase.
+
+PACT_COMPLETE
+`,
     })
 
     expect(JSON.parse(readFileSync(join(loop.loopDir, "round-01-review-decision.json"), "utf-8"))).toMatchObject({
@@ -1532,6 +1575,15 @@ describe("recordReviewDecision", () => {
       feedback_path: join(loop.loopDir, "round-01-feedback.md"),
       resulting_status: "running",
       resulting_phase: "review",
+      review_guidance: {
+        role: "advisory",
+        goalAlignmentSummary: "ACs: 1/1 addressed | Forgotten items: 0 | Unjustified deferrals: 0",
+        progressAudit: "- task-1 is complete.",
+        acceptanceCriteriaAudit: "AC-1: MET.",
+        unresolvedMainlineGaps: "(none)",
+        defectsAndRegressions: "(none)",
+        suggestedPriorities: "- Enter review phase.",
+      },
     })
     expect(readFileSync(join(loop.loopDir, "round-01-feedback.md"), "utf-8")).toContain("Enter review phase")
   })

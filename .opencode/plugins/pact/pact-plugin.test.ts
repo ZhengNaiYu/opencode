@@ -534,9 +534,14 @@ describe("PACT Codex planner and reviewer", () => {
     expect(packageText).not.toContain("P2P")
     expect(packageText).not.toContain("eval_tests.patch")
     expect(packageText).not.toContain("Latest Verification Log Tail")
-    expect(packageText).toContain("Use the worker-safe continuation package and changed files to make workspace-only source changes")
-    expect(readFileSync(join(loop.loopDir, "round-02-prompt.md"), "utf-8")).toContain("# PACT Round 02 Worker Prompt")
-    expect(readFileSync(join(loop.loopDir, "round-02-prompt.md"), "utf-8")).toContain("## Current State Snapshot")
+    expect(packageText).toContain("Reviewer guidance is evidence, not assignment")
+    expect(packageText).toContain("Do not modify PACT artifacts or run gates")
+    expect(packageText).toContain("Changed workspace files to inspect for current behavior")
+    expect(JSON.parse(readFileSync(join(loop.loopDir, "round-01-continuation-package.json"), "utf-8"))).not.toHaveProperty(
+      "next_worker_instruction",
+    )
+    expect(nextPrompt).toContain("# PACT Round 02 Worker Prompt")
+    expect(nextPrompt).toContain("## Current State Snapshot")
     expect(nextPrompt).not.toContain("TestRecord.java:152")
     expect(nextPrompt).not.toContain("F2P")
     expect(nextPrompt).not.toContain("P2P")

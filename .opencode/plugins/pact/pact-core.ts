@@ -128,6 +128,16 @@ type PlanTask = {
   status: "pending" | "active" | "complete" | "deferred"
 }
 
+export type ReviewGuidance = {
+  role: "advisory"
+  goalAlignmentSummary?: string
+  progressAudit?: string
+  acceptanceCriteriaAudit?: string
+  unresolvedMainlineGaps?: string
+  defectsAndRegressions?: string
+  suggestedPriorities?: string
+}
+
 export type ReviewDecision = {
   marker: ReviewMarker
   reason?: string
@@ -332,6 +342,8 @@ export type ContinuationPackageArtifact = {
   patch_sha256?: string
   changed_files: string[]
   latest_failure_signature?: string
+  review_guidance?: ReviewGuidance
+  /** @deprecated Legacy field retained for old replay artifacts. New packages use review_guidance. */
   next_worker_instruction?: string
   feedback_path?: string
   verification?: {
@@ -431,6 +443,7 @@ export type ReviewDecisionArtifact = {
   resulting_phase?: LoopPhase
   created_at: string
   reason?: string
+  review_guidance?: ReviewGuidance
 }
 
 export type ReplayCaseArtifact = {
@@ -1229,11 +1242,7 @@ export function writeContinuationPackage(input: {
 }): { artifact: ContinuationPackageArtifact; markdown: string } {
   const paths = artifactPaths(input.loopDir, input.round)
   const remainingWorkerRounds = Math.max(0, input.maxRounds - input.workerRoundCount)
-  const rawNextWorkerInstruction = extractNextWorkerInstruction(input.reviewText ?? "")
-  const nextWorkerInstruction = workerSafeNextInstruction(rawNextWorkerInstruction, {
-    verification: input.verification,
-    changedFiles: input.changedFiles ?? [],
-  })
+  const reviewGuidance = extractReviewGuidance(input.reviewText ?? "")
   const latestFailureSignature = workerSafeFailureSignature(input.verification?.failure_signature)
   const artifact = stripUndefined({
     schema: "pact-continuation-package/v1",
@@ -1248,7 +1257,7 @@ export function writeContinuationPackage(input: {
     patch_sha256: input.patchSha256,
     changed_files: input.changedFiles ?? [],
     latest_failure_signature: latestFailureSignature,
-    next_worker_instruction: nextWorkerInstruction,
+    review_guidance: hasReviewGuidanceContent(reviewGuidance) ? reviewGuidance : undefined,
     verification: input.verification
       ? {
           status: input.verification.status,
@@ -1260,7 +1269,7 @@ export function writeContinuationPackage(input: {
     loopDir: input.loopDir,
     reviewText: input.reviewText,
     changedFiles: input.changedFiles ?? [],
-    suggestedFocus: nextWorkerInstruction,
+    reviewGuidance,
   })
   writeJsonFile(paths.continuationPackageJson, artifact)
   writeFileSync(paths.continuationPackage, markdown, "utf-8")
@@ -1271,7 +1280,7 @@ function buildCurrentStateSnapshot(input: {
   loopDir: string
   reviewText?: string
   changedFiles?: string[]
-  suggestedFocus?: string
+  reviewGuidance?: ReviewGuidance
 }): string {
   const planPath = join(input.loopDir, "plan.md")
   const todoPath = join(input.loopDir, "todo.md")
@@ -1279,7 +1288,7 @@ function buildCurrentStateSnapshot(input: {
   const planText = existsSync(planPath) ? readFileSync(planPath, "utf-8") : ""
   const todoText = existsSync(todoPath) ? readFileSync(todoPath, "utf-8") : ""
   const goalTrackerText = existsSync(goalTrackerPath) ? readFileSync(goalTrackerPath, "utf-8") : ""
-  const reviewerFeedback = reviewerFeedbackSnapshot(input.reviewText ?? "", input.suggestedFocus)
+  const reviewerGuidance = reviewerGuidanceSnapshot(input.reviewText ?? "", input.reviewGuidance)
 
   return [
     "# PACT Current State Snapshot",
@@ -1293,18 +1302,26 @@ function buildCurrentStateSnapshot(input: {
     "## Task State",
     taskStateSnapshot(goalTrackerText, todoText),
     "",
-    "## Reviewer Feedback To Incorporate",
-    "### Constraints",
-    reviewerFeedback.constraints,
+    "## Reviewer Guidance To Incorporate",
+    "Reviewer guidance is evidence, not assignment. Use it with the Ultimate Goal, unfinished ACs/tasks, and current state when writing the next round contract.",
     "",
-    "### Blockers",
-    reviewerFeedback.blockers,
+    "### Goal Alignment Summary",
+    reviewerGuidance.goalAlignmentSummary,
     "",
-    "### Evidence",
-    reviewerFeedback.evidence,
+    "### Progress Audit",
+    reviewerGuidance.progressAudit,
     "",
-    "### Suggested Focus",
-    reviewerFeedback.suggestedFocus,
+    "### Acceptance Criteria Audit",
+    reviewerGuidance.acceptanceCriteriaAudit,
+    "",
+    "### Unresolved Mainline Gaps",
+    reviewerGuidance.unresolvedMainlineGaps,
+    "",
+    "### Defects and Regressions",
+    reviewerGuidance.defectsAndRegressions,
+    "",
+    "### Suggested Priorities",
+    reviewerGuidance.suggestedPriorities,
     "",
     "## Open Items",
     openItemsSnapshot(goalTrackerText),
@@ -1381,38 +1398,68 @@ function taskStateSnapshot(goalTrackerText: string, todoText: string): string {
     "| --- | --- | --- | --- |",
     ...(outputRows.length
       ? outputRows
-      : ["| task-1 | pending | - | Choose the smallest coherent next step toward the objective. |"]),
+      : ["| task-1 | pending | - | Choose a coherent objective that advances the Ultimate Goal. |"]),
   ].join("\n")
 }
 
-function reviewerFeedbackSnapshot(
-  reviewText: string,
-  suggestedFocus: string | undefined,
-): { constraints: string; blockers: string; evidence: string; suggestedFocus: string } {
-  const safeSuggestedFocus = sanitizeSnapshotBlock(suggestedFocus ?? "")
-  const constraints = bulletList([
-    "Do not modify PACT artifacts or run gates; make workspace-only source changes.",
-    sanitizeSnapshotBlock(extractMarkdownSection(reviewText, "Constraints") ?? ""),
-  ])
-  const blockers = bulletList([
-    sanitizeSnapshotBlock(extractMarkdownSection(reviewText, "Findings") ?? ""),
-    sanitizeSnapshotBlock(extractMarkdownSection(reviewText, "Blocking Side Issues") ?? ""),
-    sanitizeSnapshotBlock(extractMarkdownSection(reviewText, "Acceptance Criteria Audit") ?? ""),
-  ])
-  const evidence = bulletList([
-    sanitizeSnapshotBlock(extractMarkdownSection(reviewText, "Claim Audit") ?? ""),
-    sanitizeSnapshotBlock(extractMarkdownSection(reviewText, "Public Verification Gate") ?? ""),
-    sanitizeSnapshotBlock(extractMarkdownSection(reviewText, "Goal Alignment Summary") ?? ""),
-  ])
-  const focusBody = safeSuggestedFocus
-    ? `${safeSuggestedFocus}\n\nThis is guidance, not a replacement for the objective.`
-    : "(none identified)\n\nThis is guidance, not a replacement for the objective."
+function reviewerGuidanceSnapshot(reviewText: string, guidance: ReviewGuidance | undefined): Record<keyof ReviewGuidance, string> {
+  const reviewGuidance = guidance ?? extractReviewGuidance(reviewText)
   return {
-    constraints,
-    blockers,
-    evidence,
-    suggestedFocus: focusBody,
+    role: "advisory",
+    goalAlignmentSummary: reviewGuidance.goalAlignmentSummary || "(none identified)",
+    progressAudit: reviewGuidance.progressAudit || "(none identified)",
+    acceptanceCriteriaAudit: reviewGuidance.acceptanceCriteriaAudit || "(none identified)",
+    unresolvedMainlineGaps: reviewGuidance.unresolvedMainlineGaps || "(none identified)",
+    defectsAndRegressions: reviewGuidance.defectsAndRegressions || "(none identified)",
+    suggestedPriorities: reviewGuidance.suggestedPriorities || "(none identified)",
   }
+}
+
+function extractReviewGuidance(reviewText: string): ReviewGuidance {
+  const findings = reviewGuidanceSection(reviewText, "Findings")
+  const blockingSideIssues = reviewGuidanceSection(reviewText, "Blocking Side Issues")
+  const legacyDefects =
+    findings || blockingSideIssues ? bulletList([findings ?? "", blockingSideIssues ?? ""]) : undefined
+  const suggestedPriorities =
+    reviewGuidanceSection(reviewText, "Suggested Priorities") ?? legacySuggestedPriorities(reviewText)
+  return stripUndefined({
+    role: "advisory",
+    goalAlignmentSummary: reviewGuidanceSection(reviewText, "Goal Alignment Summary"),
+    progressAudit: reviewGuidanceSection(reviewText, "Progress Audit"),
+    acceptanceCriteriaAudit: reviewGuidanceSection(reviewText, "Acceptance Criteria Audit"),
+    unresolvedMainlineGaps:
+      reviewGuidanceSection(reviewText, "Unresolved Mainline Gaps") ?? reviewGuidanceSection(reviewText, "Mainline Gaps"),
+    defectsAndRegressions: reviewGuidanceSection(reviewText, "Defects and Regressions") ?? legacyDefects,
+    suggestedPriorities,
+  } satisfies ReviewGuidance) as ReviewGuidance
+}
+
+function reviewGuidanceSection(reviewText: string, heading: string): string | undefined {
+  const section = sanitizeSnapshotBlock(stripReviewTerminalMarker(extractMarkdownSection(reviewText, heading) ?? ""))
+  return section || undefined
+}
+
+function legacySuggestedPriorities(reviewText: string): string | undefined {
+  return workerSafeNextInstruction(extractNextWorkerInstruction(reviewText), { changedFiles: [] })
+}
+
+function stripReviewTerminalMarker(text: string): string {
+  const terminal = lastNonEmptyLine(text)
+  if (terminal === "PACT_COMPLETE" || terminal === "PACT_STOP" || terminal === "PACT_CONTINUE") {
+    return stripFinalNonEmptyLine(text)
+  }
+  return text
+}
+
+function hasReviewGuidanceContent(guidance: ReviewGuidance): boolean {
+  return Boolean(
+    guidance.goalAlignmentSummary ||
+      guidance.progressAudit ||
+      guidance.acceptanceCriteriaAudit ||
+      guidance.unresolvedMainlineGaps ||
+      guidance.defectsAndRegressions ||
+      guidance.suggestedPriorities,
+  )
 }
 
 function openItemsSnapshot(goalTrackerText: string): string {
@@ -1451,11 +1498,16 @@ function workspaceStateSnapshot(changedFiles: string[]): string {
     .filter((filePath) => filePath && !isWorkerUnsafeLine(filePath))
     .slice(0, 25)
   if (!safeFiles.length) {
-    return "- No changed files were recorded in the latest worker snapshot."
+    return [
+      "- Do not modify PACT artifacts or run gates; PACT owns patch export and external validation.",
+      "- No changed files were recorded in the latest worker snapshot.",
+    ].join("\n")
   }
-  return ["- Changed workspace files to inspect for current behavior:", ...safeFiles.map((filePath) => `  - ${filePath}`)].join(
-    "\n",
-  )
+  return [
+    "- Do not modify PACT artifacts or run gates; PACT owns patch export and external validation.",
+    "- Changed workspace files to inspect for current behavior:",
+    ...safeFiles.map((filePath) => `  - ${filePath}`),
+  ].join("\n")
 }
 
 function markdownTableRows(markdown: string): string[][] {
@@ -1797,6 +1849,7 @@ export function recordReviewDecision(input: {
 }): ReviewDecision {
   const reviewPath = join(input.loopDir, `round-${roundName(input.round)}-review.md`)
   writeFileSync(reviewPath, input.reviewText.trim() + "\n", "utf-8")
+  const reviewGuidance = extractReviewGuidance(input.reviewText)
   const parsedDecision = parseReviewDecision(input.reviewText)
   const forcedContinue = input.forceContinue && parsedDecision.marker === "complete" ? input.forceContinue : undefined
   const decision =
@@ -1889,6 +1942,7 @@ export function recordReviewDecision(input: {
       resulting_phase: state.phase,
       created_at: new Date().toISOString(),
       reason: decision.reason,
+      review_guidance: hasReviewGuidanceContent(reviewGuidance) ? reviewGuidance : undefined,
     } satisfies ReviewDecisionArtifact),
   )
   return decision
@@ -2062,7 +2116,7 @@ Return exactly three marker blocks:
 ## Task Breakdown
 | Task ID | Description | Target AC | Tag | Depends On |
 | --- | --- | --- | --- | --- |
-| task-1 | Implement the smallest coherent checkpoint. | AC-1 | coding | - |
+| task-1 | Implement a coherent objective toward the Ultimate Goal. | AC-1 | coding | - |
 
 ## Pending Decisions
 - ...
@@ -2072,7 +2126,7 @@ Return exactly three marker blocks:
 # Todo
 | Task ID | Description | Target AC | Tag | Depends On | Status |
 | --- | --- | --- | --- | --- | --- |
-| task-1 | Implement the smallest coherent checkpoint. | AC-1 | coding | - | pending |
+| task-1 | Implement a coherent objective toward the Ultimate Goal. | AC-1 | coding | - | pending |
 <<<END_PACT_TODO>>>
 
 <<<PACT_GOAL_TRACKER>>>
@@ -2132,6 +2186,7 @@ ${snapshot}
 
 First action: write ${join(input.loopDir, `round-${roundName(input.round)}-contract.md`)} with:
 - single mainline objective
+- why this objective
 - target ACs
 - blocking issues
 - queued out-of-scope issues
@@ -2139,9 +2194,15 @@ First action: write ${join(input.loopDir, `round-${roundName(input.round)}-contr
 
 Do not edit source files, run tests, or inspect unrelated files before this contract exists. Missing contract is a reviewer-blocking defect.
 
+Round objective selection:
+- Your job is to make as much correct progress toward the Ultimate Goal as this bounded round allows.
+- When writing the contract, start from the Ultimate Goal, all unfinished ACs/tasks, and the current state snapshot.
+- Prefer the broadest coherent objective that can realistically be implemented, tested, and summarized in this round.
+- Use a smaller checkpoint only when the broader objective would be unsafe, incoherent, or too large to verify.
+- If you choose a smaller checkpoint, explicitly state which Ultimate Goal requirements remain and why they are safe to defer for this round.
+
 Rules:
 - Preserve the immutable goal and acceptance criteria.
-- Make the smallest code changes that satisfy the active task.
 - Do not use Task/subagent delegation; do the work in this session so PACT can observe and replay the round.
 - Do not create or edit external validation-owned patch files; PACT owns patch export.
 - Do not run external validation gates or validation-owned commands; PACT runs verification after the round.
@@ -2205,12 +2266,20 @@ ${snapshot.trim()}
 
 First action: write ${join(input.loopDir, `round-${roundName(input.round)}-contract.md`)} with:
 - single mainline objective
+- why this objective
 - target ACs
 - blocking issues
 - queued out-of-scope issues
 - success criteria
 
-In the contract, choose your own smallest coherent plan for advancing the objective, considering reviewer feedback.
+Round objective selection:
+- Your job is to make as much correct progress toward the Ultimate Goal as this bounded round allows.
+- When writing the contract, start from the Ultimate Goal, unfinished ACs/tasks, current state, and reviewer guidance.
+- Prefer the broadest coherent objective that can realistically be implemented, tested, and summarized in this round.
+- Use a smaller checkpoint only when the broader objective would be unsafe, incoherent, or too large to verify.
+- If you choose a smaller checkpoint, explicitly state which Ultimate Goal requirements remain and why they are safe to defer for this round.
+- Treat reviewer feedback as evidence, not as an assignment that overrides the Ultimate Goal.
+
 Do not edit source files, run tests, or inspect unrelated files before this contract exists. Missing contract is a reviewer-blocking defect.
 
 Before stopping, write an honest summary to ${join(input.loopDir, `round-${roundName(input.round)}-summary.md`)}.
@@ -2295,7 +2364,7 @@ You are the independent PACT reviewer.
 - Patch metadata: ${input.patchArtifactPath ?? artifactPaths(input.loopDir, input.round).patchArtifact}
 - Public round verification: ${input.verificationPath ?? artifactPaths(input.loopDir, input.round).verification}
 
-Treat the patch, changed files, goal tracker, and public verification artifact as facts. Hidden/final eval is not available during worker rounds and must not be inferred or copied into Next Worker Instructions.
+Treat the patch, changed files, goal tracker, and public verification artifact as facts. Hidden/final eval is not available during worker rounds and must not be inferred or copied into reviewer guidance.
 
 ## Worker Claims
 - Round summary: ${input.summaryPath}
@@ -2327,6 +2396,9 @@ State whether this checkpoint is complete or needs another worker round.
 ### Goal Alignment Summary
 Use this compact line: ACs: X/Y addressed | Forgotten items: N | Unjustified deferrals: N
 
+### Progress Audit
+List completed, partially completed, and not-started work as facts. Do not select the next worker objective.
+
 ### Public Verification Gate
 State public verification status/build_status if present, and whether this checkpoint is allowed to become a candidate for final hidden scoring.
 
@@ -2338,6 +2410,12 @@ Audit the round contract as a worker claim. State whether it is too broad, too n
 
 ### Acceptance Criteria Audit
 Audit each AC from the goal tracker as MET, PARTIAL, NOT MET, or DEFERRED with evidence.
+
+### Unresolved Mainline Gaps
+List unfinished mainline requirements based on the ultimate goal, ACs/tasks, goal tracker, patch, and worker summary.
+
+### Defects and Regressions
+List concrete defects or regressions. If none, write "(none)".
 
 ### Findings
 List concrete issues. If none, write "(none)".
@@ -2356,8 +2434,8 @@ If the worker summary includes a Goal Tracker Update Request, approve or reject 
 Use "APPROVED" only when the requested mutable-section update is justified.
 Never approve changes to the immutable section.
 
-### Next Worker Instructions
-If more work is needed, give singular, directive instructions for the next smallest checkpoint.
+### Suggested Priorities
+List non-binding advisory priorities for future work. These are evidence for the next worker, not an assignment and not a replacement for the Ultimate Goal. Do not narrow the next worker round to a single checkpoint unless the facts show broader progress would be unsafe or unverifiable.
 
 Only if all acceptance criteria and the current phase requirements are fully satisfied, write PACT_COMPLETE as the final non-empty line.
 For any other outcome, do not write a terminal marker. PACT_STOP and PACT_CONTINUE are deprecated and will be treated as continuation feedback.
@@ -2586,7 +2664,7 @@ function normalizeTodoArtifact(text: string): string {
       : [
           {
             id: "task-1",
-            description: "Implement the smallest coherent checkpoint.",
+            description: "Implement a coherent objective toward the Ultimate Goal.",
             targetAC: "AC-1",
             tag: "coding",
             dependsOn: "-",
@@ -2722,7 +2800,7 @@ function extractTaskRows(planContent: string, criteria: AcceptanceCriterion[]): 
     return [
       {
         id: "task-1",
-        description: "Implement the smallest coherent checkpoint.",
+        description: "Implement a coherent objective toward the Ultimate Goal.",
         targetAC: criteria[0]?.id ?? "AC-1",
         tag: "coding",
         dependsOn: "-",
