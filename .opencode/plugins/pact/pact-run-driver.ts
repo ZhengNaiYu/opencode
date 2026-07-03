@@ -1,12 +1,13 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs"
 import { spawnSync as nodeSpawnSync } from "node:child_process"
 import { cwd, env, exit, argv } from "node:process"
-import { basename, join, resolve } from "node:path"
+import { basename, isAbsolute, join, relative, resolve } from "node:path"
 
 import {
   appendRoundEvent,
   applyApprovedGoalTrackerUpdates,
   applyPlannerArtifacts,
+  applyReviewStatusDelta,
   artifactPaths,
   buildInitialWorkerPrompt,
   buildContinuationPrompt,
@@ -19,6 +20,7 @@ import {
   commitRoundHistory,
   createLoop,
   exportReplayCase,
+  extractReviewStatusDelta,
   findActiveLoop,
   ensureGitInfoExclude,
   markWorkerRoundAttempted,
@@ -271,7 +273,13 @@ export function runPactDriver(input: {
     sessionID = state.active_round_session_id ?? state.active_session_id
     const promptPath = join(loopDir, `round-${roundName(state.next_round ?? state.current_round)}-prompt.md`)
     if (!existsSync(promptPath) || (sessionStrategy === "same-session" && !sessionID)) {
-      return { status: "missing_prompt", invocations, loopDir, round: state.next_round ?? state.current_round, exitCode: 2 }
+      return {
+        status: "missing_prompt",
+        invocations,
+        loopDir,
+        round: state.next_round ?? state.current_round,
+        exitCode: 2,
+      }
     }
     nextPrompt = readFileSync(promptPath, "utf-8")
     promptRound = state.next_round ?? state.current_round
@@ -391,6 +399,7 @@ function initializeDriverLoop(input: {
     round: 1,
     todoPath: join(loop.loopDir, "todo.md"),
     goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+    workerPath: workerPathRenderer(input.projectRoot),
   })
   writeFileSync(join(loop.loopDir, "round-01-prompt.md"), prompt, "utf-8")
   ensureDriverRoundStartArtifacts({
@@ -458,8 +467,8 @@ function initializeDriverLoopFromRound0(input: {
     session_strategy: input.sessionStrategy ?? sourceState.session_strategy ?? "new-per-round",
     round_boundary: "run_exit",
     trajectory_mode: sourceState.trajectory_mode ?? "full-redact",
-    planner_backend: input.plannerBackend,
-    planner_model: input.plannerModel,
+    planner_backend: sourceState.planner_backend ?? input.plannerBackend,
+    planner_model: sourceState.planner_model === undefined ? input.plannerModel : sourceState.planner_model,
     reviewer_backend: input.reviewerBackend,
     reviewer_model: input.reviewerModel,
     worker_backend: "opencode-cli",
@@ -493,6 +502,7 @@ function initializeDriverLoopFromRound0(input: {
     round: 1,
     todoPath: join(loopDir, "todo.md"),
     goalTrackerPath: join(loopDir, "goal-tracker.md"),
+    workerPath: workerPathRenderer(input.projectRoot),
   })
   writeFileSync(join(loopDir, "round-01-prompt.md"), prompt, "utf-8")
   ensureDriverRoundStartArtifacts({
@@ -539,18 +549,40 @@ function allocateResumeLoopDir(projectRoot: string, sourceLoopID: string): strin
 function copyRound0ResumePackage(sourceLoopDir: string, targetLoopDir: string): void {
   for (const fileName of readdirSync(sourceLoopDir)) {
     const sourcePath = join(sourceLoopDir, fileName)
-    if (!statSync(sourcePath).isFile()) continue
+    const sourceStat = statSync(sourcePath)
+    if (sourceStat.isDirectory()) {
+      if (fileName === "spec-source") {
+        copyDirectory(sourcePath, join(targetLoopDir, fileName))
+      }
+      continue
+    }
+    if (!sourceStat.isFile()) continue
     if (
       fileName === "source-plan.md" ||
       fileName === "plan.md" ||
       fileName === "todo.md" ||
       fileName === "goal-tracker.md" ||
+      fileName.startsWith("spec-") ||
       fileName.startsWith("round-00-")
     ) {
       copyFileSync(sourcePath, join(targetLoopDir, fileName))
     }
   }
   copyFileSync(join(sourceLoopDir, "loop-manifest.json"), join(targetLoopDir, "resume-source-loop-manifest.json"))
+}
+
+function copyDirectory(sourceDir: string, targetDir: string): void {
+  mkdirSync(targetDir, { recursive: true })
+  for (const fileName of readdirSync(sourceDir)) {
+    const sourcePath = join(sourceDir, fileName)
+    const targetPath = join(targetDir, fileName)
+    const sourceStat = statSync(sourcePath)
+    if (sourceStat.isDirectory()) {
+      copyDirectory(sourcePath, targetPath)
+      continue
+    }
+    if (sourceStat.isFile()) copyFileSync(sourcePath, targetPath)
+  }
 }
 
 function writeResumeManifest(input: {
@@ -733,7 +765,9 @@ function finalizeRoundAfterRunExit(input: {
   })
 
   const currentSummaryPath =
-    initialState.phase === "finalize" ? join(input.loopDir, "finalize-summary.md") : summaryPath(input.loopDir, input.round)
+    initialState.phase === "finalize"
+      ? join(input.loopDir, "finalize-summary.md")
+      : summaryPath(input.loopDir, input.round)
   const summaryExists = existsSync(currentSummaryPath)
   const summary = summaryExists ? readFileSync(currentSummaryPath, "utf-8") : ""
   const contractPath = join(input.loopDir, `round-${roundName(input.round)}-contract.md`)
@@ -826,7 +860,11 @@ function finalizeRoundAfterRunExit(input: {
     patchArtifactPath: paths.patchArtifact,
     verificationPath: verification ? paths.verification : undefined,
     reviewKind:
-      initialState.phase === "full_alignment" ? "full_alignment" : initialState.phase === "review" ? "review" : "implementation",
+      initialState.phase === "full_alignment"
+        ? "full_alignment"
+        : initialState.phase === "review"
+          ? "review"
+          : "implementation",
   })
   writeFileSync(join(input.loopDir, `round-${roundName(input.round)}-review-prompt.md`), reviewPrompt, "utf-8")
 
@@ -854,7 +892,8 @@ function finalizeRoundAfterRunExit(input: {
       loopID: failedState.loop_id,
       round: input.round,
       type: "review_finished",
-      sessionID: failedState.previous_round_session_id ?? failedState.active_round_session_id ?? failedState.active_session_id,
+      sessionID:
+        failedState.previous_round_session_id ?? failedState.active_round_session_id ?? failedState.active_session_id,
       data: { status: "failed", parse_status: decision.parseStatus },
     })
     writeRoundResult({
@@ -875,37 +914,49 @@ function finalizeRoundAfterRunExit(input: {
     return failedState
   }
 
-  applyApprovedGoalTrackerUpdates({
-    loopDir: input.loopDir,
-    round: input.round,
-    reviewText,
-    summaryText: summary,
-  })
+  const forceContinue =
+    patchArtifact.checks.apply_check.status === "failed"
+      ? {
+          parseStatus: "patch_apply_failed" as const,
+          reason: "patch_apply_check_failed",
+          feedback: `PACT patch apply check failed. Fix source changes so the exported patch applies cleanly.`,
+        }
+      : verification && !driverVerificationPassed(verification)
+        ? {
+            parseStatus: "build_gate_failed" as const,
+            reason: "build_gate_failed",
+            feedback: driverBuildGateFeedback(verification),
+            verification,
+          }
+        : undefined
   const decision = recordReviewDecision({
     loopDir: input.loopDir,
     round: input.round,
     reviewText,
     reviewerBackend: initialState.reviewer_backend,
     reviewerModel: initialState.reviewer_model,
-    forceContinue:
-      patchArtifact.checks.apply_check.status === "failed"
-        ? {
-            parseStatus: "patch_apply_failed",
-            reason: "patch_apply_check_failed",
-            feedback: `PACT patch apply check failed. Fix source changes so the exported patch applies cleanly.`,
-          }
-        : verification && !driverVerificationPassed(verification)
-          ? {
-              parseStatus: "build_gate_failed",
-              reason: "build_gate_failed",
-              feedback: driverBuildGateFeedback(verification),
-              verification,
-            }
-          : undefined,
+    forceContinue,
   })
+  const gateAllowed = !forceContinue
+  const statusDelta = extractReviewStatusDelta(reviewText)
+  const appliedStatusDelta = applyReviewStatusDelta({
+    loopDir: input.loopDir,
+    round: input.round,
+    delta: statusDelta,
+    gateAllowed,
+  })
+  if (!appliedStatusDelta && gateAllowed) {
+    applyApprovedGoalTrackerUpdates({
+      loopDir: input.loopDir,
+      round: input.round,
+      reviewText,
+      summaryText: summary,
+    })
+  }
   let nextState = readState(input.loopDir)
   const finalHiddenGate =
-    decision.marker === "complete" && (initialState.phase === "implementation" || initialState.phase === "full_alignment")
+    decision.marker === "complete" &&
+    (initialState.phase === "implementation" || initialState.phase === "full_alignment")
       ? runFinalHiddenGate({
           projectRoot: input.projectRoot,
           loopDir: input.loopDir,
@@ -935,6 +986,7 @@ function finalizeRoundAfterRunExit(input: {
       changedFiles: patchArtifact.eval_patch.changed_files,
       patchSha256: patchArtifact.eval_patch.sha256,
       feedbackPath: nextState.last_feedback_path,
+      gateAllowed,
     })
   }
   writeRoundState({
@@ -965,7 +1017,14 @@ function finalizeRoundAfterRunExit(input: {
   const failure =
     finalHiddenGate && finalHiddenGate.status !== "passed"
       ? { build_gate_failed: true }
-      : driverRoundFailure(decision.marker, nextState.status, input.round, nextState.max_rounds, patchArtifact, verification)
+      : driverRoundFailure(
+          decision.marker,
+          nextState.status,
+          input.round,
+          nextState.max_rounds,
+          patchArtifact,
+          verification,
+        )
   const roundResult = writeRoundResult({
     loopDir: input.loopDir,
     loopID: nextState.loop_id,
@@ -1016,7 +1075,7 @@ function ensureDriverRoundStartArtifacts(input: {
   const paths = artifactPaths(input.loopDir, input.round)
   const sessionID =
     input.state.session_strategy === "same-session"
-      ? input.state.active_round_session_id ?? input.state.active_session_id
+      ? (input.state.active_round_session_id ?? input.state.active_session_id)
       : undefined
   if (!existsSync(paths.roundState)) {
     writeRoundState({
@@ -1071,17 +1130,20 @@ function writeNextPromptAfterDriverRound(input: {
   model: string
 }): void {
   if (input.state.status !== "running") return
-  const feedbackPath = input.state.last_feedback_path ?? join(input.loopDir, `round-${roundName(input.reviewedRound)}-feedback.md`)
+  const workerPath = workerPathRenderer(input.projectRoot)
+  const feedbackPath =
+    input.state.last_feedback_path ?? join(input.loopDir, `round-${roundName(input.reviewedRound)}-feedback.md`)
   const goalTrackerPath = join(input.loopDir, "goal-tracker.md")
   let prompt: string | undefined
   if (input.state.phase === "finalize") {
-    prompt = buildFinalizePrompt({ loopDir: input.loopDir, round: input.state.current_round, goalTrackerPath })
+    prompt = buildFinalizePrompt({ loopDir: input.loopDir, round: input.state.current_round, goalTrackerPath, workerPath })
   } else if (input.state.phase === "review") {
     prompt = buildReviewPhasePrompt({
       loopDir: input.loopDir,
       round: input.state.current_round,
       feedbackPath,
       goalTrackerPath,
+      workerPath,
     })
   } else if (input.state.phase === "implementation") {
     prompt = buildContinuationPrompt({
@@ -1090,6 +1152,7 @@ function writeNextPromptAfterDriverRound(input: {
       feedbackPath,
       goalTrackerPath,
       continuationPackagePath: artifactPaths(input.loopDir, input.reviewedRound).continuationPackage,
+      workerPath,
     })
   }
   if (!prompt) return
@@ -1097,7 +1160,7 @@ function writeNextPromptAfterDriverRound(input: {
   writeFileSync(promptPath, prompt, "utf-8")
   const sessionID =
     input.state.session_strategy === "same-session"
-      ? input.state.active_round_session_id ?? input.state.active_session_id
+      ? (input.state.active_round_session_id ?? input.state.active_session_id)
       : undefined
   writeRoundState({
     loopDir: input.loopDir,
@@ -1136,6 +1199,15 @@ function writeNextPromptAfterDriverRound(input: {
   })
 }
 
+function workerPathRenderer(projectRoot: string): (path: string) => string {
+  return (path: string): string => {
+    const rel = relative(projectRoot, path)
+    if (rel && !rel.startsWith("..") && !isAbsolute(rel)) return rel
+    if (!rel) return "."
+    return path
+  }
+}
+
 function runDriverVerification(input: {
   projectRoot: string
   loopDir: string
@@ -1172,7 +1244,7 @@ function runDriverVerification(input: {
     loopDir: input.loopDir,
     round: input.round,
     command,
-    status: timedOut ? "timeout" : parsed.status ?? (result.status === 0 ? "passed" : "failed"),
+    status: timedOut ? "timeout" : (parsed.status ?? (result.status === 0 ? "passed" : "failed")),
     exitCode: result.status,
     durationMs: Date.now() - started,
     patchSha256: input.patchArtifact.eval_patch.sha256,
@@ -1183,7 +1255,9 @@ function runDriverVerification(input: {
     p2p: parsed.p2p,
     errorCategories: parsed.error_categories,
     failureSignature: parsed.failure_signature,
-    logText: [parsed.rawJson ? "" : stdout, stderr, result.error ? String(result.error) : ""].filter(Boolean).join("\n"),
+    logText: [parsed.rawJson ? "" : stdout, stderr, result.error ? String(result.error) : ""]
+      .filter(Boolean)
+      .join("\n"),
     source: "lightweight",
   })
 }
@@ -1309,15 +1383,16 @@ function runFinalHiddenGateSuite(input: {
   const stderr = String(result.stderr ?? "")
   const timedOut = Boolean(result.error && /timed out|ETIMEDOUT/i.test(String(result.error)))
   const parsed = parseDriverVerificationOutput(stdout)
-  const status =
-    timedOut
-      ? "timeout"
-      : parsed.status === "passed" && result.status === 0
+  const status = timedOut
+    ? "timeout"
+    : parsed.status === "passed" && result.status === 0
+      ? "passed"
+      : result.status === 0 && parsed.resolved === true
         ? "passed"
-        : result.status === 0 && parsed.resolved === true
-          ? "passed"
-          : "failed"
-  const logText = redactText([parsed.rawJson ? "" : stdout, stderr, result.error ? String(result.error) : ""].filter(Boolean).join("\n"))
+        : "failed"
+  const logText = redactText(
+    [parsed.rawJson ? "" : stdout, stderr, result.error ? String(result.error) : ""].filter(Boolean).join("\n"),
+  )
   writeFileSync(logPath, logText, "utf-8")
   const artifact: FinalHiddenGateSuiteResult = cleanJson({
     suite: input.suite,
@@ -1468,8 +1543,16 @@ function isVerificationJson(value: Record<string, unknown>): boolean {
   )
 }
 
-function normalizeVerificationStatus(value: unknown): "not_run" | "passed" | "failed" | "timeout" | "infra_failed" | undefined {
-  if (value === "not_run" || value === "passed" || value === "failed" || value === "timeout" || value === "infra_failed") {
+function normalizeVerificationStatus(
+  value: unknown,
+): "not_run" | "passed" | "failed" | "timeout" | "infra_failed" | undefined {
+  if (
+    value === "not_run" ||
+    value === "passed" ||
+    value === "failed" ||
+    value === "timeout" ||
+    value === "infra_failed"
+  ) {
     return value
   }
   if (value === "success" || value === true) return "passed"
@@ -1721,10 +1804,7 @@ function dockerResourceArgs(): string[] {
   return args
 }
 
-function dockerWorkerEnvArgs(input: {
-  workerPluginMount?: string
-  workerContainerPluginMount: string
-}): string[] {
+function dockerWorkerEnvArgs(input: { workerPluginMount?: string; workerContainerPluginMount: string }): string[] {
   const args: string[] = []
   for (const name of ["ZAI_API_KEY", "ZAI_API_BASE", "OPENCODE_CONFIG", "MSWEA_MODEL_NAME"]) {
     if (env[name]) args.push("-e", name)
@@ -1736,7 +1816,10 @@ function dockerWorkerEnvArgs(input: {
   return args
 }
 
-function containerOpenCodeConfig(input: { workerPluginMount?: string; workerContainerPluginMount: string }): string | undefined {
+function containerOpenCodeConfig(input: {
+  workerPluginMount?: string
+  workerContainerPluginMount: string
+}): string | undefined {
   const config = env.OPENCODE_CONFIG_CONTENT
   if (!config) return undefined
   const hostPluginMount = input.workerPluginMount ?? inferredPluginMount()
@@ -1744,7 +1827,10 @@ function containerOpenCodeConfig(input: { workerPluginMount?: string; workerCont
   return config.split(hostPluginMount).join(input.workerContainerPluginMount)
 }
 
-function containerPluginPath(input: { workerPluginMount?: string; workerContainerPluginMount: string }): string | undefined {
+function containerPluginPath(input: {
+  workerPluginMount?: string
+  workerContainerPluginMount: string
+}): string | undefined {
   const pluginPath = env.PACT_PLUGIN_PATH
   const hostPluginMount = input.workerPluginMount ?? inferredPluginMount()
   if (!pluginPath || !hostPluginMount || !pluginPath.startsWith(hostPluginMount)) return undefined
@@ -1854,9 +1940,7 @@ export function cliArgs(raw: string[]): {
     resumeLoopDir: parsed["resume-loop"] ?? env.PACT_RESUME_LOOP_DIR,
     resumeMode: parseResumeMode(parsed["resume-mode"] ?? env.PACT_RESUME_MODE),
     sessionStrategy: parsed["session-strategy"] === "same-session" ? "same-session" : "new-per-round",
-    fullAlignmentInterval: parsed["full-alignment-interval"]
-      ? Number(parsed["full-alignment-interval"])
-      : undefined,
+    fullAlignmentInterval: parsed["full-alignment-interval"] ? Number(parsed["full-alignment-interval"]) : undefined,
   }
 }
 

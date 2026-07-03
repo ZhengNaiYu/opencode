@@ -12,7 +12,7 @@ import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import { dirname, isAbsolute, join, resolve } from "node:path"
 
-export type PlannerBackend = "opencode-agent" | "codex-cli"
+export type PlannerBackend = "opencode-agent" | "codex-cli" | "spec-import"
 export type ReviewerBackend = "opencode-agent" | "codex-cli"
 export type WorkerBackend = "opencode-cli"
 export type LoopStatus = "running" | "complete" | "stopped" | "cancelled"
@@ -136,6 +136,14 @@ export type ReviewGuidance = {
   unresolvedMainlineGaps?: string
   defectsAndRegressions?: string
   suggestedPriorities?: string
+}
+
+export type ReviewStatusDelta = {
+  role: "reviewer_confirmed"
+  ac?: Record<string, "met" | "partial" | "not_met" | "deferred" | "blocked">
+  tasks?: Record<string, "complete" | "partial" | "pending" | "deferred" | "blocked">
+  approved?: string[]
+  rejected?: string[]
 }
 
 export type ReviewDecision = {
@@ -343,13 +351,14 @@ export type ContinuationPackageArtifact = {
   changed_files: string[]
   latest_failure_signature?: string
   review_guidance?: ReviewGuidance
+  review_status_delta?: ReviewStatusDelta
   /** @deprecated Legacy field retained for old replay artifacts. New packages use review_guidance. */
   next_worker_instruction?: string
   feedback_path?: string
   verification?: {
     status: VerificationStatus
     build_status?: string
-    path: string
+    path?: string
   }
 }
 
@@ -444,6 +453,7 @@ export type ReviewDecisionArtifact = {
   created_at: string
   reason?: string
   review_guidance?: ReviewGuidance
+  review_status_delta?: ReviewStatusDelta
 }
 
 export type ReplayCaseArtifact = {
@@ -579,8 +589,7 @@ export function readState(loopDir: string): PactState {
   const state = JSON.parse(readFileSync(join(loopDir, "state.json"), "utf-8")) as PactState
   state.phase ??= state.status === "complete" ? "complete" : state.status === "stopped" ? "stopped" : "implementation"
   state.full_alignment_interval ??= 5
-  const legacyRoundCount =
-    state.worker_round_count ?? Math.max(0, Math.max(1, Number(state.current_round) || 1) - 1)
+  const legacyRoundCount = state.worker_round_count ?? Math.max(0, Math.max(1, Number(state.current_round) || 1) - 1)
   state.next_round ??= state.current_round ?? 1
   state.current_round = state.next_round
   state.attempted_worker_rounds ??= legacyRoundCount
@@ -762,7 +771,14 @@ export function createLoop(input: CreateLoopInput): LoopInfo {
     status: "complete",
     notes: "Round 00 initializes the canonical plan, todo ledger, goal tracker, and base snapshot.",
   })
-  writeRoundSnapshot({ projectRoot: input.projectRoot, loopDir, loopID, round: 0, stage: "git", time: now.toISOString() })
+  writeRoundSnapshot({
+    projectRoot: input.projectRoot,
+    loopDir,
+    loopID,
+    round: 0,
+    stage: "git",
+    time: now.toISOString(),
+  })
   writeRoundResult({
     loopDir,
     loopID,
@@ -941,7 +957,11 @@ export function capturePatchArtifact(input: {
   writeFileSync(paths.workspacePatch, workspaceCapture.patchText, "utf-8")
   writeFileSync(paths.evalPatch, evalCapture.patchText, "utf-8")
   writeFileSync(paths.testPatch, testCapture.patchText, "utf-8")
-  const workspaceMetadata = patchMetadata(paths.workspacePatch, workspaceCapture.patchText, workspaceCapture.changedFiles)
+  const workspaceMetadata = patchMetadata(
+    paths.workspacePatch,
+    workspaceCapture.patchText,
+    workspaceCapture.changedFiles,
+  )
   const evalMetadata = patchMetadata(paths.evalPatch, evalCapture.patchText, evalCapture.changedFiles)
   const testMetadata = patchMetadata(paths.testPatch, testCapture.patchText, testCapture.changedFiles)
   const artifact: PatchArtifact = {
@@ -1238,11 +1258,16 @@ export function writeContinuationPackage(input: {
   changedFiles?: string[]
   patchSha256?: string
   feedbackPath?: string
+  gateAllowed?: boolean
   time?: string
 }): { artifact: ContinuationPackageArtifact; markdown: string } {
   const paths = artifactPaths(input.loopDir, input.round)
   const remainingWorkerRounds = Math.max(0, input.maxRounds - input.workerRoundCount)
   const reviewGuidance = extractReviewGuidance(input.reviewText ?? "")
+  const reviewStatusDelta = gateSafeReviewStatusDelta(
+    extractReviewStatusDelta(input.reviewText ?? ""),
+    input.gateAllowed,
+  )
   const latestFailureSignature = workerSafeFailureSignature(input.verification?.failure_signature)
   const artifact = stripUndefined({
     schema: "pact-continuation-package/v1",
@@ -1258,6 +1283,7 @@ export function writeContinuationPackage(input: {
     changed_files: input.changedFiles ?? [],
     latest_failure_signature: latestFailureSignature,
     review_guidance: hasReviewGuidanceContent(reviewGuidance) ? reviewGuidance : undefined,
+    review_status_delta: reviewStatusDelta,
     verification: input.verification
       ? {
           status: input.verification.status,
@@ -1270,6 +1296,8 @@ export function writeContinuationPackage(input: {
     reviewText: input.reviewText,
     changedFiles: input.changedFiles ?? [],
     reviewGuidance,
+    reviewStatusDelta,
+    verification: input.verification,
   })
   writeJsonFile(paths.continuationPackageJson, artifact)
   writeFileSync(paths.continuationPackage, markdown, "utf-8")
@@ -1281,6 +1309,8 @@ function buildCurrentStateSnapshot(input: {
   reviewText?: string
   changedFiles?: string[]
   reviewGuidance?: ReviewGuidance
+  reviewStatusDelta?: ReviewStatusDelta
+  verification?: RoundVerificationArtifact
 }): string {
   const planPath = join(input.loopDir, "plan.md")
   const todoPath = join(input.loopDir, "todo.md")
@@ -1289,6 +1319,7 @@ function buildCurrentStateSnapshot(input: {
   const todoText = existsSync(todoPath) ? readFileSync(todoPath, "utf-8") : ""
   const goalTrackerText = existsSync(goalTrackerPath) ? readFileSync(goalTrackerPath, "utf-8") : ""
   const reviewerGuidance = reviewerGuidanceSnapshot(input.reviewText ?? "", input.reviewGuidance)
+  const reviewStatusDelta = input.reviewStatusDelta ?? extractReviewStatusDelta(input.reviewText ?? "")
 
   return [
     "# PACT Current State Snapshot",
@@ -1297,10 +1328,10 @@ function buildCurrentStateSnapshot(input: {
     snapshotObjective(input.loopDir),
     "",
     "## Acceptance Criteria Status",
-    acceptanceCriteriaStatusSnapshot(goalTrackerText, planText),
+    acceptanceCriteriaStatusSnapshot(goalTrackerText, planText, reviewStatusDelta),
     "",
     "## Task State",
-    taskStateSnapshot(goalTrackerText, todoText),
+    taskStateSnapshot(goalTrackerText, todoText, reviewStatusDelta),
     "",
     "## Reviewer Guidance To Incorporate",
     "Reviewer guidance is evidence, not assignment. Use it with the Ultimate Goal, unfinished ACs/tasks, and current state when writing the next round contract.",
@@ -1326,6 +1357,9 @@ function buildCurrentStateSnapshot(input: {
     "## Open Items",
     openItemsSnapshot(goalTrackerText),
     "",
+    "## Verification Status",
+    verificationStatusSnapshot(input.verification),
+    "",
     "## Current Workspace State",
     workspaceStateSnapshot(input.changedFiles ?? []),
     "",
@@ -1346,7 +1380,11 @@ function snapshotObjective(loopDir: string, planPath?: string): string {
   )
 }
 
-function acceptanceCriteriaStatusSnapshot(goalTrackerText: string, planText: string): string {
+function acceptanceCriteriaStatusSnapshot(
+  goalTrackerText: string,
+  planText: string,
+  reviewStatusDelta?: ReviewStatusDelta,
+): string {
   const section =
     extractMarkdownSection(goalTrackerText, "Acceptance Criteria") ??
     extractMarkdownSection(planText, "Acceptance Criteria") ??
@@ -1357,9 +1395,10 @@ function acceptanceCriteriaStatusSnapshot(goalTrackerText: string, planText: str
   const outputRows = dataRows.map((row) => {
     const ac = row[0]?.trim() || "AC-1"
     const criterion = row[1]?.trim() || "Current acceptance criterion"
-    const status = row[4]?.trim() || row[2]?.trim() || "pending"
     const evidence = evidenceByAC.get(ac) ?? "-"
-    const remainingGaps = /\b(?:complete|verified|done|resolved|passed)\b/i.test(status)
+    const status =
+      reviewStatusDelta?.ac?.[ac] ?? (evidence !== "-" ? "met" : row[4]?.trim() || row[2]?.trim() || "pending")
+    const remainingGaps = isCompleteStatus(status)
       ? "none recorded"
       : "See reviewer feedback, open items, and remaining task work."
     return `| ${escapeTableCell(ac)} | ${escapeTableCell(sanitizeSnapshotBlock(criterion))} | ${escapeTableCell(sanitizeSnapshotBlock(status))} | ${escapeTableCell(sanitizeSnapshotBlock(evidence))} | ${escapeTableCell(sanitizeSnapshotBlock(remainingGaps))} |`
@@ -1374,22 +1413,22 @@ function acceptanceCriteriaStatusSnapshot(goalTrackerText: string, planText: str
   ].join("\n")
 }
 
-function taskStateSnapshot(goalTrackerText: string, todoText: string): string {
+function taskStateSnapshot(goalTrackerText: string, todoText: string, reviewStatusDelta?: ReviewStatusDelta): string {
   const todoRows = markdownTableRows(todoText).filter((row) => /^task-\d+/i.test(row[0]?.trim() ?? ""))
   const activeRows = markdownTableRows(extractMarkdownSection(goalTrackerText, "Active Tasks") ?? "").filter((row) =>
     /^task-\d+/i.test(row[0]?.trim() ?? ""),
   )
-  const rows = todoRows.length ? todoRows : activeRows
+  const rows = activeRows.length ? activeRows : todoRows
   const evidenceByTask = completedEvidenceByTask(goalTrackerText)
   const outputRows = rows.map((row) => {
     const task = row[0]?.trim() || "task-1"
-    const fromTodo = todoRows.length > 0
+    const fromTodo = !activeRows.length && todoRows.length > 0
     const description = fromTodo ? row[1]?.trim() || task : row[5]?.trim() || task
-    const status = fromTodo ? row[5]?.trim() || "pending" : row[2]?.trim() || "pending"
     const evidence = evidenceByTask.get(task) ?? "-"
-    const remainingWork = /\b(?:complete|verified|done|resolved|passed)\b/i.test(status)
-      ? "none"
-      : description || "Continue this task."
+    const status =
+      reviewStatusDelta?.tasks?.[task] ??
+      (evidence !== "-" ? "complete" : fromTodo ? row[5]?.trim() || "pending" : row[2]?.trim() || "pending")
+    const remainingWork = isCompleteStatus(status) ? "none" : description || "Continue this task."
     return `| ${escapeTableCell(task)} | ${escapeTableCell(sanitizeSnapshotBlock(status))} | ${escapeTableCell(sanitizeSnapshotBlock(evidence))} | ${escapeTableCell(sanitizeSnapshotBlock(remainingWork))} |`
   })
 
@@ -1402,7 +1441,14 @@ function taskStateSnapshot(goalTrackerText: string, todoText: string): string {
   ].join("\n")
 }
 
-function reviewerGuidanceSnapshot(reviewText: string, guidance: ReviewGuidance | undefined): Record<keyof ReviewGuidance, string> {
+function isCompleteStatus(status: string): boolean {
+  return /\b(?:complete|met|verified|done|resolved|passed)\b/i.test(status)
+}
+
+function reviewerGuidanceSnapshot(
+  reviewText: string,
+  guidance: ReviewGuidance | undefined,
+): Record<keyof ReviewGuidance, string> {
   const reviewGuidance = guidance ?? extractReviewGuidance(reviewText)
   return {
     role: "advisory",
@@ -1428,10 +1474,58 @@ function extractReviewGuidance(reviewText: string): ReviewGuidance {
     progressAudit: reviewGuidanceSection(reviewText, "Progress Audit"),
     acceptanceCriteriaAudit: reviewGuidanceSection(reviewText, "Acceptance Criteria Audit"),
     unresolvedMainlineGaps:
-      reviewGuidanceSection(reviewText, "Unresolved Mainline Gaps") ?? reviewGuidanceSection(reviewText, "Mainline Gaps"),
+      reviewGuidanceSection(reviewText, "Unresolved Mainline Gaps") ??
+      reviewGuidanceSection(reviewText, "Mainline Gaps"),
     defectsAndRegressions: reviewGuidanceSection(reviewText, "Defects and Regressions") ?? legacyDefects,
     suggestedPriorities,
   } satisfies ReviewGuidance) as ReviewGuidance
+}
+
+export function extractReviewStatusDelta(reviewText: string): ReviewStatusDelta | undefined {
+  const section = extractMarkdownSection(reviewText, "Status Delta")
+  if (!section || /^\s*\(?none\)?\s*$/i.test(section)) return undefined
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(section)
+  if (!fenced) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(fenced[1]?.trim() ?? "")
+  } catch {
+    return undefined
+  }
+  if (!isRecord(parsed) || parsed.role !== "reviewer_confirmed") return undefined
+  const delta = stripUndefined({
+    role: "reviewer_confirmed",
+    ac: statusRecord(parsed.ac, ["met", "partial", "not_met", "deferred", "blocked"], /^AC-\d+(?:\.\d+)?$/i),
+    tasks: statusRecord(parsed.tasks, ["complete", "partial", "pending", "deferred", "blocked"], /^task-\d+$/i),
+    approved: stringList(parsed.approved),
+    rejected: stringList(parsed.rejected),
+  } satisfies ReviewStatusDelta) as ReviewStatusDelta
+  if (!delta.ac && !delta.tasks && !delta.approved?.length && !delta.rejected?.length) return undefined
+  return delta
+}
+
+function statusRecord<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  keyPattern: RegExp,
+): Record<string, T> | undefined {
+  if (!isRecord(value)) return undefined
+  const allowedSet = new Set<string>(allowed)
+  const entries = Object.entries(value)
+    .map(([key, status]) => [key.trim(), typeof status === "string" ? status.trim() : ""] as const)
+    .filter(([key]) => keyPattern.test(key))
+    .filter((entry): entry is readonly [string, T] => allowedSet.has(entry[1]))
+  return entries.length ? Object.fromEntries(entries) : undefined
+}
+
+function stringList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const lines = value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => sanitizeSnapshotBlock(item))
+    .filter(Boolean)
+    .slice(0, 20)
+  return lines.length ? lines : undefined
 }
 
 function reviewGuidanceSection(reviewText: string, heading: string): string | undefined {
@@ -1463,11 +1557,11 @@ function hasReviewGuidanceContent(guidance: ReviewGuidance): boolean {
 }
 
 function openItemsSnapshot(goalTrackerText: string): string {
-  const openIssueRows = markdownTableRows(extractMarkdownSection(goalTrackerText, "Open Issues") ?? "").filter((row) =>
-    row.some((cell) => cell.trim()),
+  const openIssueRows = markdownTableRows(extractMarkdownSection(goalTrackerText, "Open Issues") ?? "").filter(
+    (row) => row.some((cell) => cell.trim()) && !/^Issue$/i.test(row[0]?.trim() ?? ""),
   )
-  const deferredRows = markdownTableRows(extractMarkdownSection(goalTrackerText, "Explicitly Deferred") ?? "").filter((row) =>
-    row.some((cell) => cell.trim()),
+  const deferredRows = markdownTableRows(extractMarkdownSection(goalTrackerText, "Explicitly Deferred") ?? "").filter(
+    (row) => row.some((cell) => cell.trim()) && !/^Task$/i.test(row[0]?.trim() ?? ""),
   )
   const outputRows = [
     ...openIssueRows.map((row) => {
@@ -1490,6 +1584,17 @@ function openItemsSnapshot(goalTrackerText: string): string {
     "| --- | --- | --- | --- |",
     ...(outputRows.length ? outputRows : ["| (none recorded) | - | - | - |"]),
   ].join("\n")
+}
+
+function verificationStatusSnapshot(verification: RoundVerificationArtifact | undefined): string {
+  if (!verification) return "- Verification status: not recorded for this round."
+  return [
+    `- Verification status: ${verification.status}`,
+    verification.build_status ? `- Build status: ${verification.build_status}` : undefined,
+    verification.applied === undefined ? undefined : `- Patch applied: ${verification.applied}`,
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n")
 }
 
 function workspaceStateSnapshot(changedFiles: string[]): string {
@@ -1515,7 +1620,12 @@ function markdownTableRows(markdown: string): string[][] {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.startsWith("|") && line.endsWith("|"))
-    .map((line) => line.slice(1, -1).split("|").map((cell) => cell.trim()))
+    .map((line) =>
+      line
+        .slice(1, -1)
+        .split("|")
+        .map((cell) => cell.trim()),
+    )
     .filter((row) => !isMarkdownSeparatorRow(row))
   if (rows.length > 1 && !/^AC-\d+|^task-\d+/i.test(rows[0]?.[0] ?? "")) return rows.slice(1)
   return rows
@@ -1588,7 +1698,9 @@ export function exportReplayCase(input: {
   const postSnapshot = existsSync(paths.postSnapshot) ? readJsonFile<unknown>(paths.postSnapshot) : undefined
   const trajectory = existsSync(paths.trajectory) ? readJsonFile<unknown>(paths.trajectory) : undefined
   const evidence = existsSync(paths.evidenceJson) ? readJsonFile<unknown>(paths.evidenceJson) : undefined
-  const verification = existsSync(paths.verification) ? readJsonFile<RoundVerificationArtifact>(paths.verification) : undefined
+  const verification = existsSync(paths.verification)
+    ? readJsonFile<RoundVerificationArtifact>(paths.verification)
+    : undefined
   const continuationPackage = existsSync(paths.continuationPackageJson)
     ? readJsonFile<ContinuationPackageArtifact>(paths.continuationPackageJson)
     : undefined
@@ -1609,7 +1721,7 @@ export function exportReplayCase(input: {
           path: feedbackPath,
           sha256: sha256Text(feedbackText),
           text: feedbackText,
-  }
+        }
   const artifact: ReplayCaseArtifact = {
     schema: "pact-replay-case/v2",
     artifact_version: 2,
@@ -1710,7 +1822,11 @@ export function applyPlannerArtifacts(loopDir: string, artifacts: PlannerArtifac
   if (artifacts.plan) {
     writeFileSync(join(loopDir, "plan.md"), sanitizePlannerArtifactText(artifacts.plan).trim() + "\n", "utf-8")
   }
-  writeFileSync(join(loopDir, "todo.md"), normalizeTodoArtifact(sanitizePlannerArtifactText(artifacts.todo)).trim() + "\n", "utf-8")
+  writeFileSync(
+    join(loopDir, "todo.md"),
+    normalizeTodoArtifact(sanitizePlannerArtifactText(artifacts.todo)).trim() + "\n",
+    "utf-8",
+  )
   writeFileSync(
     join(loopDir, "goal-tracker.md"),
     normalizeGoalTrackerArtifact(sanitizePlannerArtifactText(artifacts.goalTracker), "plan.md").trim() + "\n",
@@ -1850,17 +1966,17 @@ export function recordReviewDecision(input: {
   const reviewPath = join(input.loopDir, `round-${roundName(input.round)}-review.md`)
   writeFileSync(reviewPath, input.reviewText.trim() + "\n", "utf-8")
   const reviewGuidance = extractReviewGuidance(input.reviewText)
+  const reviewStatusDelta = extractReviewStatusDelta(input.reviewText)
   const parsedDecision = parseReviewDecision(input.reviewText)
   const forcedContinue = input.forceContinue && parsedDecision.marker === "complete" ? input.forceContinue : undefined
-  const decision =
-    forcedContinue
-      ? {
-          marker: "continue" as const,
-          reason: forcedContinue.reason,
-          parseStatus: forcedContinue.parseStatus,
-          terminalLine: parsedDecision.terminalLine,
-        }
-      : parsedDecision
+  const decision = forcedContinue
+    ? {
+        marker: "continue" as const,
+        reason: forcedContinue.reason,
+        parseStatus: forcedContinue.parseStatus,
+        terminalLine: parsedDecision.terminalLine,
+      }
+    : parsedDecision
   const state = readState(input.loopDir)
   let feedbackPath: string | undefined
   state.last_review_marker = decision.marker
@@ -1908,7 +2024,8 @@ export function recordReviewDecision(input: {
     }
     setNextRoundCursor(state, input.round + 1)
     advanceRoundSession(state)
-    const reviewedWorkerRounds = state.reviewed_worker_rounds ?? state.completed_worker_rounds ?? state.worker_round_count ?? 0
+    const reviewedWorkerRounds =
+      state.reviewed_worker_rounds ?? state.completed_worker_rounds ?? state.worker_round_count ?? 0
     if (implementationWorkerRound && reviewedWorkerRounds >= state.max_rounds) {
       state.phase = "stopped"
       state.status = "stopped"
@@ -1935,7 +2052,9 @@ export function recordReviewDecision(input: {
           ? "build_gate"
           : "patch_apply"
         : undefined,
-      verification_ref: forcedContinue?.verification ? artifactPaths(input.loopDir, input.round).verification : undefined,
+      verification_ref: forcedContinue?.verification
+        ? artifactPaths(input.loopDir, input.round).verification
+        : undefined,
       reviewer_backend: input.reviewerBackend,
       reviewer_model: input.reviewerModel,
       resulting_status: state.status,
@@ -1943,6 +2062,7 @@ export function recordReviewDecision(input: {
       created_at: new Date().toISOString(),
       reason: decision.reason,
       review_guidance: hasReviewGuidanceContent(reviewGuidance) ? reviewGuidance : undefined,
+      review_status_delta: reviewStatusDelta,
     } satisfies ReviewDecisionArtifact),
   )
   return decision
@@ -2166,11 +2286,14 @@ export function buildInitialWorkerPrompt(input: {
   round: number
   todoPath: string
   goalTrackerPath: string
+  workerPath?: (path: string) => string
 }): string {
+  const workerPath = input.workerPath ?? ((path: string) => path)
   const snapshot = buildCurrentStateSnapshot({
     loopDir: input.loopDir,
     changedFiles: [],
   })
+  const specEvidenceLines = specEvidenceReferenceLines(input.loopDir, workerPath)
   return `# PACT Round ${roundName(input.round)} Worker Prompt
 
 ## Objective
@@ -2184,7 +2307,7 @@ ${snapshot}
 
 ## Required Process
 
-First action: write ${join(input.loopDir, `round-${roundName(input.round)}-contract.md`)} with:
+First action: write ${workerPath(join(input.loopDir, `round-${roundName(input.round)}-contract.md`))} with:
 - single mainline objective
 - why this objective
 - target ACs
@@ -2210,15 +2333,23 @@ Rules:
 - Do not directly edit todo.md, plan.md, source-plan.md, review artifacts, result artifacts, state artifacts, or replay artifacts.
 - Do not directly edit the immutable section of goal-tracker.md.
 - If goal tracker or todo ledger updates are needed, include a "Goal Tracker / Ledger Update Request" section in your summary.
-- Before stopping, write an honest summary to ${join(input.loopDir, `round-${roundName(input.round)}-summary.md`)}.
+- Before stopping, write an honest summary to ${workerPath(join(input.loopDir, `round-${roundName(input.round)}-summary.md`))}.
+Summary must be concise but specific:
+- Changed files and why
+- ACs/tasks advanced
+- Verification commands and actual results
+- Known gaps/blockers
+- Assumptions
+- Goal Tracker / Ledger Update Request, if justified
 - After writing the summary, stop work and return control to PACT. Do not keep coding, testing, or editing after the summary is written.
 - Do not use web/code-host lookup.
 
 ## Reference Files
-- Plan: ${join(input.loopDir, "plan.md")}
-- Todo: ${input.todoPath}
-- Goal tracker: ${input.goalTrackerPath}
-- Pre-round snapshot: ${artifactPaths(input.loopDir, input.round).preSnapshot}
+- Plan: ${workerPath(join(input.loopDir, "plan.md"))}
+- Todo: ${workerPath(input.todoPath)}
+- Goal tracker: ${workerPath(input.goalTrackerPath)}
+${specEvidenceLines.join("\n")}
+- Pre-round snapshot: ${workerPath(artifactPaths(input.loopDir, input.round).preSnapshot)}
 
 The reviewer will inspect your summary and the repository state when this bounded run ends.
 `
@@ -2235,7 +2366,9 @@ export function buildContinuationPrompt(input: {
   cumulativePatchPath?: string
   continuationPackagePath?: string
   continuationPackageText?: string
+  workerPath?: (path: string) => string
 }): string {
+  const workerPath = input.workerPath ?? ((path: string) => path)
   const packageText =
     input.continuationPackageText ??
     (input.continuationPackagePath && existsSync(input.continuationPackagePath)
@@ -2247,6 +2380,7 @@ export function buildContinuationPrompt(input: {
       loopDir: input.loopDir,
       changedFiles: [],
     })
+  const specEvidenceLines = specEvidenceReferenceLines(input.loopDir, workerPath)
   return `# PACT Round ${roundName(input.round)} Worker Prompt
 
 The previous round did not pass review.
@@ -2264,7 +2398,7 @@ ${snapshot.trim()}
 
 ## Required Process
 
-First action: write ${join(input.loopDir, `round-${roundName(input.round)}-contract.md`)} with:
+First action: write ${workerPath(join(input.loopDir, `round-${roundName(input.round)}-contract.md`))} with:
 - single mainline objective
 - why this objective
 - target ACs
@@ -2282,12 +2416,14 @@ Round objective selection:
 
 Do not edit source files, run tests, or inspect unrelated files before this contract exists. Missing contract is a reviewer-blocking defect.
 
-Before stopping, write an honest summary to ${join(input.loopDir, `round-${roundName(input.round)}-summary.md`)}.
-Summary must explain:
-- what ACs/tasks you advanced
-- what reviewer feedback you addressed
-- what remains
-- what was tested
+Before stopping, write an honest summary to ${workerPath(join(input.loopDir, `round-${roundName(input.round)}-summary.md`))}.
+Summary must be concise but specific:
+- Changed files and why
+- ACs/tasks advanced
+- Verification commands and actual results
+- Known gaps/blockers
+- Assumptions
+- Goal Tracker / Ledger Update Request, if justified
 
 After writing the summary, stop work and return control to PACT. Do not keep coding, testing, or editing after the summary is written.
 Do not use Task/subagent delegation; do the work in this session so PACT can observe and replay the round.
@@ -2299,12 +2435,13 @@ If goal tracker or todo ledger updates are needed, include a "Goal Tracker / Led
 Do not use web/code-host lookup.
 
 ## Reference Files
-- Plan: ${input.planPath ?? join(input.loopDir, "plan.md")}
-- Todo: ${input.todoPath ?? join(input.loopDir, "todo.md")}
-- Goal tracker: ${input.goalTrackerPath}
-- Continuation package: ${input.continuationPackagePath ?? artifactPaths(input.loopDir, Math.max(1, input.round - 1)).continuationPackage}
-- Pre-round snapshot: ${input.preSnapshotPath ?? artifactPaths(input.loopDir, input.round).preSnapshot}
-- Previous review feedback: ${input.feedbackPath}
+- Plan: ${workerPath(input.planPath ?? join(input.loopDir, "plan.md"))}
+- Todo: ${workerPath(input.todoPath ?? join(input.loopDir, "todo.md"))}
+- Goal tracker: ${workerPath(input.goalTrackerPath)}
+${specEvidenceLines.join("\n")}
+- Continuation package: ${workerPath(input.continuationPackagePath ?? artifactPaths(input.loopDir, Math.max(1, input.round - 1)).continuationPackage)}
+- Pre-round snapshot: ${workerPath(input.preSnapshotPath ?? artifactPaths(input.loopDir, input.round).preSnapshot)}
+- Previous review feedback: ${workerPath(input.feedbackPath)}
 `
 }
 
@@ -2352,6 +2489,7 @@ The implementation reviewer already signaled PACT_COMPLETE. Now perform a code-r
 Focus on correctness, regressions, missing tests, and benchmark-facing patch quality.
 `
       : ""
+  const specEvidenceLines = specEvidenceReferenceLines(input.loopDir, (path) => path)
   return `# PACT Review Round ${roundName(input.round)}
 
 You are the independent PACT reviewer.
@@ -2360,6 +2498,7 @@ You are the independent PACT reviewer.
 - Plan: ${input.planPath ?? join(input.loopDir, "plan.md")}
 - Todo: ${input.todoPath ?? join(input.loopDir, "todo.md")}
 - Goal tracker: ${input.goalTrackerPath ?? join(input.loopDir, "goal-tracker.md")}
+${specEvidenceLines.join("\n")}
 - Eval patch: ${input.evalPatchPath ?? artifactPaths(input.loopDir, input.round).evalPatch}
 - Patch metadata: ${input.patchArtifactPath ?? artifactPaths(input.loopDir, input.round).patchArtifact}
 - Public round verification: ${input.verificationPath ?? artifactPaths(input.loopDir, input.round).verification}
@@ -2434,6 +2573,12 @@ If the worker summary includes a Goal Tracker Update Request, approve or reject 
 Use "APPROVED" only when the requested mutable-section update is justified.
 Never approve changes to the immutable section.
 
+### Status Delta
+If status changed, include one compact fenced JSON block with reviewer-confirmed AC/task status. If no status changed, write "(none)".
+Example: \`\`\`json
+{"role":"reviewer_confirmed","ac":{"AC-1":"partial"},"tasks":{"task-1":"complete"}}
+\`\`\`
+
 ### Suggested Priorities
 List non-binding advisory priorities for future work. These are evidence for the next worker, not an assignment and not a replacement for the Ultimate Goal. Do not narrow the next worker round to a single checkpoint unless the facts show broader progress would be unsafe or unverifiable.
 
@@ -2447,35 +2592,43 @@ export function buildReviewPhasePrompt(input: {
   round: number
   feedbackPath: string
   goalTrackerPath: string
+  workerPath?: (path: string) => string
 }): string {
+  const workerPath = input.workerPath ?? ((path: string) => path)
   return `# PACT Review Phase ${roundName(input.round)}
 
 The implementation phase has passed its reviewer gate. Now perform a code-review-focused checkpoint.
 
 Read:
-- Review phase instructions: ${input.feedbackPath}
-- Goal tracker: ${input.goalTrackerPath}
-- Plan: ${join(input.loopDir, "plan.md")}
+- Review phase instructions: ${workerPath(input.feedbackPath)}
+- Goal tracker: ${workerPath(input.goalTrackerPath)}
+- Plan: ${workerPath(join(input.loopDir, "plan.md"))}
 - Patch artifacts from the previous round.
 
 Fix review-phase issues only. Do not add unrelated features.
-Before stopping, write an honest summary to ${summaryPath(input.loopDir, input.round)}.
+Before stopping, write an honest summary to ${workerPath(summaryPath(input.loopDir, input.round))}.
 `
 }
 
-export function buildFinalizePrompt(input: { loopDir: string; round: number; goalTrackerPath: string }): string {
+export function buildFinalizePrompt(input: {
+  loopDir: string
+  round: number
+  goalTrackerPath: string
+  workerPath?: (path: string) => string
+}): string {
+  const workerPath = input.workerPath ?? ((path: string) => path)
   return `# PACT Finalize Phase
 
 Review and finalize the PACT loop.
 
 Read:
-- Goal tracker: ${input.goalTrackerPath}
-- Plan: ${join(input.loopDir, "plan.md")}
-- Latest review artifacts under ${input.loopDir}
+- Goal tracker: ${workerPath(input.goalTrackerPath)}
+- Plan: ${workerPath(join(input.loopDir, "plan.md"))}
+- Latest review artifacts under ${workerPath(input.loopDir)}
 
 Only do final verification, cleanup, and functionality-preserving simplification if needed.
 Do not use Task/subagent delegation; do the work in this session so PACT can observe and replay the round.
-Before stopping, write the final summary to ${join(input.loopDir, "finalize-summary.md")}.
+Before stopping, write the final summary to ${workerPath(join(input.loopDir, "finalize-summary.md"))}.
 `
 }
 
@@ -2527,7 +2680,8 @@ function sanitizePlannerArtifactText(text: string): string {
     .map((line) => {
       const sanitizedLine = sanitizePatchArtifactNames(line)
       if (!isWorkerOwnedPatchTask(line)) return sanitizedLine
-      if (!line.trim().startsWith("|")) return "Keep implementation and optional test changes separable for PACT/harness patch export."
+      if (!line.trim().startsWith("|"))
+        return "Keep implementation and optional test changes separable for PACT/harness patch export."
       const cells = line.split("|")
       return cells
         .map((cell, index) =>
@@ -2595,6 +2749,103 @@ export function applyApprovedGoalTrackerUpdates(input: {
   }
   writeFileSync(trackerPath, next, "utf-8")
   return true
+}
+
+export function applyReviewStatusDelta(input: {
+  loopDir: string
+  round: number
+  delta?: ReviewStatusDelta
+  gateAllowed?: boolean
+}): boolean {
+  if (!input.delta) return false
+  if (input.gateAllowed === false && statusDeltaHasCompletion(input.delta)) return false
+  const trackerPath = join(input.loopDir, "goal-tracker.md")
+  const current = readFileSync(trackerPath, "utf-8")
+  let next = current
+  let changed = false
+  const completedACs = new Set<string>()
+  const evidence = reviewStatusDeltaEvidence(input.delta)
+
+  for (const [task, status] of Object.entries(input.delta.tasks ?? {})) {
+    const updated = markActiveTaskStatus(next, task, status)
+    if (updated !== next) {
+      next = updated
+      changed = true
+    }
+    if (status === "complete") {
+      const ac = taskTargetAC(current, task) ?? "AC-1"
+      completedACs.add(ac)
+      next = appendTableRow(
+        next,
+        "### Completed and Verified",
+        `| ${ac} | ${task} | ${input.round} | ${input.round} | ${escapeTableCell(evidence)} |`,
+      )
+      changed = true
+    }
+  }
+
+  for (const [ac, status] of Object.entries(input.delta.ac ?? {})) {
+    if (status !== "met" || completedACs.has(ac)) continue
+    next = appendTableRow(
+      next,
+      "### Completed and Verified",
+      `| ${ac} | - | ${input.round} | ${input.round} | ${escapeTableCell(evidence)} |`,
+    )
+    changed = true
+  }
+
+  if (!changed && !input.delta.approved?.length && !input.delta.rejected?.length) return false
+  const summary = compactOneLine(
+    [
+      statusDeltaSummary(input.delta),
+      input.delta.approved?.length ? `approved: ${input.delta.approved.join("; ")}` : "",
+      input.delta.rejected?.length ? `rejected: ${input.delta.rejected.join("; ")}` : "",
+    ]
+      .filter(Boolean)
+      .join(" | "),
+  )
+  next = appendTableRow(
+    next,
+    "#### Plan Evolution Log",
+    `| ${input.round} | Reviewer-confirmed status delta | ${escapeTableCell(summary)} | See round-${roundName(input.round)} review |`,
+  )
+  writeFileSync(trackerPath, next, "utf-8")
+  return true
+}
+
+function statusDeltaHasCompletion(delta: ReviewStatusDelta): boolean {
+  return Object.values(delta.tasks ?? {}).includes("complete") || Object.values(delta.ac ?? {}).includes("met")
+}
+
+function gateSafeReviewStatusDelta(
+  delta: ReviewStatusDelta | undefined,
+  gateAllowed: boolean | undefined,
+): ReviewStatusDelta | undefined {
+  if (!delta || gateAllowed !== false) return delta
+  const ac = Object.fromEntries(
+    Object.entries(delta.ac ?? {}).filter(([, status]) => status !== "met"),
+  ) as ReviewStatusDelta["ac"]
+  const tasks = Object.fromEntries(
+    Object.entries(delta.tasks ?? {}).filter(([, status]) => status !== "complete"),
+  ) as ReviewStatusDelta["tasks"]
+  const safe = stripUndefined({
+    role: "reviewer_confirmed",
+    ac: ac && Object.keys(ac).length ? ac : undefined,
+    tasks: tasks && Object.keys(tasks).length ? tasks : undefined,
+    rejected: delta.rejected,
+  } satisfies ReviewStatusDelta) as ReviewStatusDelta
+  if (!safe.ac && !safe.tasks && !safe.rejected?.length) return undefined
+  return safe
+}
+
+function reviewStatusDeltaEvidence(delta: ReviewStatusDelta): string {
+  return delta.approved?.[0] || statusDeltaSummary(delta) || "Reviewer-confirmed status delta"
+}
+
+function statusDeltaSummary(delta: ReviewStatusDelta): string {
+  const ac = Object.entries(delta.ac ?? {}).map(([id, status]) => `${id}:${status}`)
+  const tasks = Object.entries(delta.tasks ?? {}).map(([id, status]) => `${id}:${status}`)
+  return [...ac, ...tasks].join(", ")
 }
 
 function hasExplicitGoalTrackerApproval(section: string): boolean {
@@ -2921,6 +3172,20 @@ function markActiveTaskStatus(text: string, task: string, status: string): strin
   )
 }
 
+function specEvidenceReferenceLines(loopDir: string, renderPath: (path: string) => string): string[] {
+  const manifestPath = join(loopDir, "spec-input-manifest.json")
+  const evidenceDir = join(loopDir, "spec-source", "enhanced_requirement_sections")
+  const localizationPath = join(loopDir, "spec-code-localization.md")
+  const lines: string[] = []
+  if (existsSync(manifestPath)) lines.push(`- Spec input manifest: ${renderPath(manifestPath)}`)
+  if (existsSync(evidenceDir)) lines.push(`- Spec evidence directory: ${renderPath(evidenceDir)}`)
+  if (existsSync(localizationPath)) lines.push(`- Spec code localization: ${renderPath(localizationPath)}`)
+  if (lines.length) {
+    lines.push("- Spec evidence is advisory; verify code-localization claims against repository source before editing.")
+  }
+  return lines
+}
+
 function escapeTableCell(text: string): string {
   return text.replace(/\r?\n/g, " ").replace(/\|/g, "\\|").trim()
 }
@@ -2931,7 +3196,10 @@ function compactOneLine(text: string): string {
 
 function tailLines(text: string, maxLines: number): string {
   const lines = text.split(/\r?\n/)
-  return lines.slice(Math.max(0, lines.length - maxLines)).join("\n").trim()
+  return lines
+    .slice(Math.max(0, lines.length - maxLines))
+    .join("\n")
+    .trim()
 }
 
 function firstUsefulLine(text: string): string | undefined {
@@ -2992,12 +3260,14 @@ function sanitizeWorkerFacingInstruction(text: string): string {
 }
 
 function mentionsHarnessOwnedWork(text: string): boolean {
-  return /\b(?:PACT\s+)?patch artifacts?\b/i.test(text) ||
+  return (
+    /\b(?:PACT\s+)?patch artifacts?\b/i.test(text) ||
     /\b(?:re)?run\b[\s\S]*\b(?:PACT\s+)?gate\b/i.test(text) ||
     /\b(?:PACT\s+)?gate\b[\s\S]*\b(?:re)?run\b/i.test(text) ||
     /\beval patch\b[\s\S]*\bincremental delta\b/i.test(text) ||
     /\beval failure\b/i.test(text) ||
     /\b(?:workspace_patch|eval_patch|patch-artifact|solution\.patch|test\.patch|lolbench_eval\.py)\b/i.test(text)
+  )
 }
 
 export function sanitizeWorkerFacingText(text: string): string {
@@ -3038,6 +3308,10 @@ function safeErrorSummary(error: unknown): string {
         ? error
         : JSON.stringify(error ?? "")
   return redactText(compactOneLine(text))
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function escapeRegExp(text: string): string {
@@ -3148,7 +3422,9 @@ function addSafePatchPath(paths: Set<string>, filePath: string | undefined): voi
 }
 
 function collectTestPatchPaths(projectRoot: string, excludes: string[]): string[] {
-  return Array.from(new Set([...collectRootTestPatchPaths(projectRoot), ...collectChangedProjectTestPaths(projectRoot, excludes)])).sort()
+  return Array.from(
+    new Set([...collectRootTestPatchPaths(projectRoot), ...collectChangedProjectTestPaths(projectRoot, excludes)]),
+  ).sort()
 }
 
 function collectRootTestPatchPaths(projectRoot: string): string[] {
@@ -3237,7 +3513,10 @@ function captureGitPatch(projectRoot: string, excludes: string[]): { patchText: 
   return { patchText, changedFiles }
 }
 
-function captureGitPatchForPaths(projectRoot: string, filePaths: string[]): { patchText: string; changedFiles: string[] } {
+function captureGitPatchForPaths(
+  projectRoot: string,
+  filePaths: string[],
+): { patchText: string; changedFiles: string[] } {
   const paths = Array.from(new Set(filePaths.filter((filePath) => filePath && !filePath.startsWith("/")))).sort()
   if (!paths.length) return { patchText: "", changedFiles: [] }
   const trackedPatch = gitStdout(projectRoot, ["diff", "--binary", "HEAD", "--", ...paths])

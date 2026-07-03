@@ -141,6 +141,15 @@ const table = sqliteTable("session", {
 - Test actual implementation, do not duplicate logic into tests
 - Tests cannot run from repo root (guard: `do-not-run-tests-from-root`); run from package dirs like `packages/opencode`.
 
+## PACT LoLBench Spec Import
+
+- The current local LoLBench requirement decomposition section bundles are at `/Users/gujiazhen/Documents/cc_codes/benchmark/lolbench_trial-outputs-reme-1dot2_v14_opencode/gpt-5.5`.
+- Deterministic PACT Round00 imports are generated at `/Users/gujiazhen/Documents/cc_codes/outputs/lolbench_pact_round0_imports_v14_opencode_best`; use `round0-imports.tsv` there to map a LoLBench case to its `spec-import-round0` resume loop.
+- To run PACT from imported requirements, pass the selected `spec-import-round0` directory to LoLBench with `--pact-resume-loop <dir>`. This skips the LLM planner and starts the driver at round 1 from imported `plan.md`, `todo.md`, and `goal-tracker.md`.
+- The importer copies the full `enhanced_requirement_sections` directory into `spec-source/enhanced_requirement_sections`; worker/reviewer prompts expose that directory plus `spec-input-manifest.json` and `spec-code-localization.md` when present.
+- Do not feed `patch_final.diff`, `solution.patch`, `test.patch`, build trajectories, hidden eval output, F2P/P2P details, or code-host lookup results into worker or reviewer prompts.
+- Full usage notes live in `docs/pact/opencode-pact-spec-import.md`.
+
 ## Type Checking
 
 - Always run `bun typecheck` from package directories (e.g., `packages/opencode`), never `tsc` directly.

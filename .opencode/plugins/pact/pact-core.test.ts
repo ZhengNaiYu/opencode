@@ -9,12 +9,14 @@ import {
   appendRoundEvent,
   applyApprovedGoalTrackerUpdates,
   applyPlannerArtifacts,
+  applyReviewStatusDelta,
   artifactPaths,
   buildContinuationPrompt,
   buildFinalizePrompt,
   buildInitialWorkerPrompt,
   buildPlannerPrompt,
   buildPlannerRepairPrompt,
+  buildReviewPhasePrompt,
   buildReviewPrompt,
   capturePatchArtifact,
   classifyRoundFailure,
@@ -258,7 +260,9 @@ Implement PEP 680 tomllib support, delivering implementation changes only in sol
     })
 
     expect(prompt).toContain("PACT/harness owns final patch export")
-    expect(prompt).toContain("Do not create acceptance criteria or tasks that ask the worker to generate, edit, stage, or inspect")
+    expect(prompt).toContain(
+      "Do not create acceptance criteria or tasks that ask the worker to generate, edit, stage, or inspect",
+    )
   })
 
   test("createLoop writes a loop manifest", () => {
@@ -479,9 +483,9 @@ Fix the bug.
       ok: false,
       missing: expect.arrayContaining(["goal_tracker_marker"]),
     })
-    expect(buildPlannerRepairPrompt({ previousOutput: "bad", validation: validatePlannerArtifacts(invalid) })).toContain(
-      "Repair the PACT planner output",
-    )
+    expect(
+      buildPlannerRepairPrompt({ previousOutput: "bad", validation: validatePlannerArtifacts(invalid) }),
+    ).toContain("Repair the PACT planner output")
   })
 
   test("createLoop defaults to codex planner and reviewer backends", () => {
@@ -643,6 +647,51 @@ Fix the bug.
     expect(readFileSync(join(loop.loopDir, "goal-tracker.md"), "utf-8")).toContain(
       "| task-1 | AC-1 | complete | coding | worker | Implement a coherent objective toward the Ultimate Goal. |",
     )
+  })
+
+  test("applies reviewer-confirmed status delta to mutable tracker state", () => {
+    const project = tempProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
+
+    const applied = applyReviewStatusDelta({
+      loopDir: loop.loopDir,
+      round: 2,
+      delta: {
+        role: "reviewer_confirmed",
+        ac: { "AC-1": "met" },
+        tasks: { "task-1": "complete" },
+        approved: ["task-1 completed with public tests"],
+      },
+      gateAllowed: true,
+    })
+
+    const tracker = readFileSync(join(loop.loopDir, "goal-tracker.md"), "utf-8")
+    expect(applied).toBe(true)
+    expect(tracker).toContain("| task-1 | AC-1 | complete | coding | worker |")
+    expect(tracker).toContain("| AC-1 | task-1 | 2 | 2 | task-1 completed with public tests |")
+    expect(tracker).toContain("Reviewer-confirmed status delta")
+  })
+
+  test("does not apply complete status delta when gate failed", () => {
+    const project = tempProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
+
+    const applied = applyReviewStatusDelta({
+      loopDir: loop.loopDir,
+      round: 2,
+      delta: {
+        role: "reviewer_confirmed",
+        ac: { "AC-1": "met" },
+        tasks: { "task-1": "complete" },
+        approved: ["task-1 completed with public tests"],
+      },
+      gateAllowed: false,
+    })
+
+    const tracker = readFileSync(join(loop.loopDir, "goal-tracker.md"), "utf-8")
+    expect(applied).toBe(false)
+    expect(tracker).not.toContain("| task-1 | AC-1 | complete | coding | worker |")
+    expect(tracker).not.toContain("| AC-1 | task-1 | 2 | 2 |")
   })
 
   test("does not apply rejected goal tracker updates containing the word approved", () => {
@@ -826,6 +875,52 @@ describe("worker prompt shape", () => {
     expect(initial).toContain("when this bounded run ends")
   })
 
+  test("worker prompts can render workspace-relative artifact paths for container-visible workers", () => {
+    const project = tempProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
+    const workerPath = (path: string) => path.replace(`${project}/`, "")
+
+    const initial = buildInitialWorkerPrompt({
+      loopDir: loop.loopDir,
+      round: 1,
+      todoPath: join(loop.loopDir, "todo.md"),
+      goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+      workerPath,
+    })
+    const continuation = buildContinuationPrompt({
+      loopDir: loop.loopDir,
+      round: 2,
+      feedbackPath: join(loop.loopDir, "round-01-feedback.md"),
+      goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+      continuationPackagePath: join(loop.loopDir, "round-01-continuation-package.md"),
+      workerPath,
+    })
+    const reviewPhase = buildReviewPhasePrompt({
+      loopDir: loop.loopDir,
+      round: 3,
+      feedbackPath: join(loop.loopDir, "round-02-feedback.md"),
+      goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+      workerPath,
+    })
+    const finalize = buildFinalizePrompt({
+      loopDir: loop.loopDir,
+      round: 4,
+      goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+      workerPath,
+    })
+
+    for (const prompt of [initial, continuation, reviewPhase, finalize]) {
+      expect(prompt).not.toContain(project)
+      expect(prompt).toContain(".pact/loops/")
+    }
+    expect(initial).toContain(".pact/loops/")
+    expect(initial).toContain("round-01-contract.md")
+    expect(continuation).toContain("round-01-feedback.md")
+    expect(continuation).toContain("round-01-continuation-package.md")
+    expect(reviewPhase).toContain("round-02-feedback.md")
+    expect(finalize).toContain("Latest review artifacts under .pact/loops/")
+  })
+
   test("continuation prompts inline current state and keep ultimate goal as the worker objective", () => {
     const project = tempProject()
     const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
@@ -904,6 +999,40 @@ Reviewer guidance is evidence, not assignment. Use it with the Ultimate Goal, un
     expect(prompt).toContain("make as much correct progress toward the Ultimate Goal as this bounded round allows")
     expect(prompt).toContain("Prefer the broadest coherent objective")
     expect(prompt).toContain("Treat reviewer feedback as evidence, not as an assignment")
+  })
+
+  test("continuation snapshot uses reviewer-confirmed mutable status before todo status", () => {
+    const project = tempProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
+    applyReviewStatusDelta({
+      loopDir: loop.loopDir,
+      round: 2,
+      delta: {
+        role: "reviewer_confirmed",
+        ac: { "AC-1": "partial" },
+        tasks: { "task-1": "complete" },
+        approved: ["task-1 implementation landed; AC-1 still needs tests"],
+      },
+      gateAllowed: true,
+    })
+
+    const { markdown } = writeContinuationPackage({
+      loopDir: loop.loopDir,
+      round: 2,
+      nextRound: 3,
+      maxRounds: 5,
+      workerRoundCount: 2,
+      loopPhase: "implementation",
+      reviewText: `### Status Delta
+\`\`\`json
+{"role":"reviewer_confirmed","ac":{"AC-1":"partial"},"tasks":{"task-1":"complete"}}
+\`\`\`
+`,
+    })
+
+    expect(markdown).toContain("| AC-1 | The implementation satisfies the plan's observable requirements. | partial |")
+    expect(markdown).toContain("| task-1 | complete |")
+    expect(markdown).not.toContain("| task-1 | pending |")
   })
 
   test("continuation package translates benchmark-owned patch and gate feedback into workspace-only work", () => {
@@ -1014,8 +1143,7 @@ Fix the patch export so round-04-eval.patch applies cleanly on top of the source
       buildStatus: "ok",
       f2p: { passed: 2, total: 6 },
       p2p: { passed: 18, total: 18 },
-      logText:
-        "test_ast.AST_Tests.test_snippets failed\nForwardRef('*c')\na[*a,] unparses as a[(*a,)]\n",
+      logText: "test_ast.AST_Tests.test_snippets failed\nForwardRef('*c')\na[*a,] unparses as a[(*a,)]\n",
     })
 
     const { markdown } = writeContinuationPackage({
@@ -1121,6 +1249,10 @@ Fix the starred-subscript unparse regression, the *args source-location regressi
     for (const prompt of [initial, continuation]) {
       expect(prompt).toContain("First action")
       expect(prompt).toContain("Missing contract is a reviewer-blocking defect")
+      expect(prompt).toContain("Changed files and why")
+      expect(prompt).toContain("Verification commands and actual results")
+      expect(prompt).toContain("Known gaps/blockers")
+      expect(prompt).toContain("Assumptions")
       expect(prompt).toContain("After writing the summary, stop work and return control")
     }
   })
@@ -1560,6 +1692,11 @@ AC-1: MET.
 ### Suggested Priorities
 - Enter review phase.
 
+### Status Delta
+\`\`\`json
+{"role":"reviewer_confirmed","ac":{"AC-1":"met"},"tasks":{"task-1":"complete"}}
+\`\`\`
+
 PACT_COMPLETE
 `,
     })
@@ -1583,6 +1720,11 @@ PACT_COMPLETE
         unresolvedMainlineGaps: "(none)",
         defectsAndRegressions: "(none)",
         suggestedPriorities: "- Enter review phase.",
+      },
+      review_status_delta: {
+        role: "reviewer_confirmed",
+        ac: { "AC-1": "met" },
+        tasks: { "task-1": "complete" },
       },
     })
     expect(readFileSync(join(loop.loopDir, "round-01-feedback.md"), "utf-8")).toContain("Enter review phase")

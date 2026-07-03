@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { execFileSync } from "node:child_process"
-import { appendFileSync, chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -333,6 +333,30 @@ Continue source changes.
       "# Goal Tracker\n## IMMUTABLE SECTION\n### Ultimate Goal\nResume.\n### Acceptance Criteria\nAC-1\n## MUTABLE SECTION\n",
       "utf-8",
     )
+    const sourceState = readState(sourceLoop.loopDir)
+    sourceState.planner_backend = "spec-import"
+    sourceState.planner_model = null
+    writeState(sourceLoop.loopDir, sourceState)
+    mkdirSync(join(sourceLoop.loopDir, "spec-source", "enhanced_requirement_sections"), { recursive: true })
+    writeFileSync(
+      join(sourceLoop.loopDir, "spec-source", "enhanced_requirement_sections", "30_semantic_search_code_localization.md"),
+      "## Semantic Search Code Localization Supplement\n",
+      "utf-8",
+    )
+    writeFileSync(join(sourceLoop.loopDir, "spec-code-localization.md"), "## Copied Localization\n", "utf-8")
+    writeFileSync(
+      join(sourceLoop.loopDir, "spec-input-manifest.json"),
+      JSON.stringify(
+        {
+          schema: "pact-spec-input-manifest/v1",
+          copied_evidence_dir: join(sourceLoop.loopDir, "spec-source", "enhanced_requirement_sections"),
+          code_localization_file: join(sourceLoop.loopDir, "spec-code-localization.md"),
+        },
+        null,
+        2,
+      ) + "\n",
+      "utf-8",
+    )
     writeFileSync(join(sourceLoop.loopDir, "round-01-prompt.md"), "stale old prompt\n", "utf-8")
 
     const calls: Array<{ input: string }> = []
@@ -367,18 +391,31 @@ Continue source changes.
     expect(existsSync(join(result.loopDir!, "round-00-result.json"))).toBe(true)
     expect(existsSync(join(result.loopDir!, "round-01-prompt.md"))).toBe(true)
     expect(readFileSync(join(result.loopDir!, "plan.md"), "utf-8")).toContain("Resume canonical plan")
-    expect(calls[0]?.input).toContain(join(result.loopDir!, "plan.md"))
+    expect(calls[0]?.input).toContain(".pact/loops/")
+    expect(calls[0]?.input).toContain("/plan.md")
+    expect(calls[0]?.input).not.toContain(result.loopDir!)
+    const roundContext = JSON.parse(readFileSync(join(result.loopDir!, "round-01-context.json"), "utf-8"))
+    expect(roundContext.prompt_path).toBe(join(result.loopDir!, "round-01-prompt.md"))
     const excludeText = gitInfoExcludeText(project)
     expect(excludeText).toContain(".pact/")
     expect(excludeText).toContain("/*.patch")
     expect(excludeText).toContain("/*.diff")
     const state = readState(result.loopDir!)
     expect(state.next_round).toBe(2)
+    expect(state.planner_backend).toBe("spec-import")
+    expect(state.planner_model).toBeNull()
     expect(state.attempted_worker_rounds).toBe(1)
     expect(state.completed_worker_rounds).toBe(1)
     const manifest = readFileSync(join(result.loopDir!, "loop-manifest.json"), "utf-8")
     expect(manifest).toContain('"resume_mode": "round0"')
     expect(manifest).toContain(sourceLoop.loopID)
+    expect(manifest).toContain('"planner_backend": "spec-import"')
+    expect(manifest).toContain('"planner_model": null')
+    expect(existsSync(join(result.loopDir!, "spec-source", "enhanced_requirement_sections"))).toBe(true)
+    expect(existsSync(join(result.loopDir!, "spec-code-localization.md"))).toBe(true)
+    expect(calls[0]?.input).toContain("Spec input manifest")
+    expect(calls[0]?.input).toContain("Spec evidence directory")
+    expect(calls[0]?.input).toContain("Spec code localization")
   })
 
   test("docker worker runner wraps each OpenCode round in a container", () => {
@@ -454,6 +491,9 @@ Continue source changes.
         "zai-coding-plan/glm-5-turbo",
       ])
       expect(calls[0]?.input).toContain("# PACT Round 01")
+      expect(calls[0]?.input).not.toContain(project)
+      expect(calls[0]?.input).toContain(".pact/loops/")
+      expect(calls[0]?.input).toContain("round-01-contract.md")
     } finally {
       if (oldConfig === undefined) delete process.env.OPENCODE_CONFIG_CONTENT
       else process.env.OPENCODE_CONFIG_CONTENT = oldConfig
@@ -595,7 +635,70 @@ AC-1: PARTIAL.
     expect(roundTwoPrompt).toContain("Inspect src.txt")
     expect(roundTwoPrompt).toContain("make as much correct progress toward the Ultimate Goal")
     expect(roundTwoPrompt).not.toContain("## Next Worker Instruction")
-    expect(readFileSync(join(loopDir, "round-01-trajectory.json"), "utf-8")).toContain("worker exited without idle review")
+    expect(readFileSync(join(loopDir, "round-01-trajectory.json"), "utf-8")).toContain(
+      "worker exited without idle review",
+    )
+  })
+
+  test("failed public verification blocks reviewer-approved completion ledger updates", () => {
+    const project = tempGitProject()
+    const fakeGate = join(project, "fake-public-gate.py")
+    writeFileSync(
+      fakeGate,
+      `#!/usr/bin/env python3
+import json
+print(json.dumps({"status":"failed","applied":True,"build_status":"failed","error_categories":["build_failure"]}))
+raise SystemExit(1)
+`,
+      "utf-8",
+    )
+    chmodSync(fakeGate, 0o755)
+    let loopDir = ""
+
+    const result = runPactDriver({
+      projectRoot: project,
+      planFile: join(project, "plan.md"),
+      model: "zai-coding-plan/glm-5-turbo",
+      maxRounds: 2,
+      opencodeCommand: "fake-opencode",
+      verificationCommand: `python3 ${JSON.stringify(fakeGate)}`,
+      maxInvocations: 1,
+      planner(_prompt, context) {
+        loopDir = context.loopDir
+        return validPlannerOutput()
+      },
+      reviewer() {
+        return `### Decision Summary
+Looks complete, but the gate will override this.
+
+### Goal Tracker Updates
+APPROVED
+
+### Status Delta
+\`\`\`json
+{"role":"reviewer_confirmed","ac":{"AC-1":"met"},"tasks":{"task-1":"complete"},"approved":["task-1 completed with public tests"]}
+\`\`\`
+
+PACT_COMPLETE
+`
+      },
+      spawnSync() {
+        appendFileSync(join(project, "src.txt"), "worker change\n", "utf-8")
+        writeFileSync(
+          join(loopDir, "round-01-summary.md"),
+          "## Goal Tracker Update Request\nMark task-1 complete with evidence: tests pass.\n",
+          "utf-8",
+        )
+        return { status: 0, stdout: "worker exited\n", stderr: "" }
+      },
+    })
+
+    expect(result.status).toBe("max_invocations")
+    const tracker = readFileSync(join(loopDir, "goal-tracker.md"), "utf-8")
+    expect(tracker).not.toContain("| task-1 | AC-1 | complete | coding | worker |")
+    expect(tracker).not.toContain("| AC-1 | task-1 | 1 | 1 |")
+    expect(readFileSync(join(loopDir, "round-01-review-decision.json"), "utf-8")).toContain("build_gate_failed")
+    expect(readFileSync(join(loopDir, "round-02-prompt.md"), "utf-8")).toContain("Verification status: failed")
   })
 
   test("reviewer candidate complete triggers final hidden gate and stops unresolved without next prompt", () => {
@@ -792,7 +895,7 @@ Continue.
 `
       },
       verificationCommand:
-        "python3 -c 'import json; print(json.dumps({\"status\":\"failed\",\"build_status\":\"ok\",\"failure_signature\":\"test_future.py failed\",\"f2p\":{\"passed\":2,\"total\":6},\"p2p\":{\"passed\":18,\"total\":18}}, indent=2))'",
+        'python3 -c \'import json; print(json.dumps({"status":"failed","build_status":"ok","failure_signature":"test_future.py failed","f2p":{"passed":2,"total":6},"p2p":{"passed":18,"total":18}}, indent=2))\'',
       spawnSync(command) {
         appendFileSync(join(project, "src.txt"), "worker change\n", "utf-8")
         return { status: 0, stdout: "worker\n", stderr: "" }
