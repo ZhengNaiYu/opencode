@@ -1,6 +1,6 @@
 ---
 description: "PACT planner: converts a plan into PACT_PLAN, PACT_TODO, and PACT_GOAL_TRACKER artifacts"
-mode: subagent
+mode: all
 permission:
   edit: deny
   bash: deny

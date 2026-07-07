@@ -1,6 +1,6 @@
 ---
 description: "PACT reviewer: independently reviews one worker checkpoint"
-mode: subagent
+mode: all
 permission:
   edit: deny
   bash:

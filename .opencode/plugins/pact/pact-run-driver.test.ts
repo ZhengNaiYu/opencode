@@ -135,6 +135,51 @@ describe("PACT run driver", () => {
     expect(parsed.reviewerModel).toBe("gpt-5.5")
   })
 
+  test("rejects OpenRouter chat as a planner or reviewer backend", () => {
+    expect(() =>
+      cliArgs([
+        "--plan-file",
+        "/tmp/PROMPT.md",
+        "--planner-backend",
+        "openrouter-chat",
+        "--planner-model",
+        "openai/gpt-5.5",
+      ]),
+    ).toThrow("Unsupported PACT planner backend: openrouter-chat")
+    expect(() =>
+      cliArgs(["--plan-file", "/tmp/PROMPT.md", "--reviewer", "openrouter-chat", "--reviewer-model", "openai/gpt-5.5"]),
+    ).toThrow("Unsupported PACT reviewer backend: openrouter-chat")
+  })
+
+  test("parses OpenCode planner and reviewer backends with agents from CLI aliases", () => {
+    const parsed = cliArgs([
+      "--plan-file",
+      "/tmp/PROMPT.md",
+      "--planner-backend",
+      "opencode-cli",
+      "--planner-agent",
+      "pact-planner",
+      "--planner-model",
+      "openrouter/z-ai/glm-5.2",
+      "--reviewer",
+      "opencode-cli",
+      "--reviewer-agent",
+      "pact-reviewer",
+      "--reviewer-model",
+      "openrouter/z-ai/glm-5.2",
+      "--worker-agent",
+      "pact-worker",
+    ])
+
+    expect(parsed.plannerBackend).toBe("opencode-cli")
+    expect(parsed.plannerAgent).toBe("pact-planner")
+    expect(parsed.plannerModel).toBe("openrouter/z-ai/glm-5.2")
+    expect(parsed.reviewerBackend).toBe("opencode-cli")
+    expect(parsed.reviewerAgent).toBe("pact-reviewer")
+    expect(parsed.reviewerModel).toBe("openrouter/z-ai/glm-5.2")
+    expect(parsed.agent).toBe("pact-worker")
+  })
+
   test("defaults worker runner from PACT env", () => {
     const oldRunner = process.env.PACT_WORKER_RUNNER
     const oldImage = process.env.LOLBENCH_AGENT_IMAGE_TAG
@@ -345,12 +390,24 @@ Continue source changes.
     )
     writeFileSync(join(sourceLoop.loopDir, "spec-code-localization.md"), "## Copied Localization\n", "utf-8")
     writeFileSync(
+      join(sourceLoop.loopDir, "target-surface-contract.md"),
+      "# Target Surface Contract\n\n## Hard Target Surface Status Gate\n",
+      "utf-8",
+    )
+    writeFileSync(
+      join(sourceLoop.loopDir, "target-surfaces.json"),
+      '{"schema":"pact-target-surfaces/v2","surfaces":[]}\n',
+      "utf-8",
+    )
+    writeFileSync(
       join(sourceLoop.loopDir, "spec-input-manifest.json"),
       JSON.stringify(
         {
           schema: "pact-spec-input-manifest/v1",
           copied_evidence_dir: join(sourceLoop.loopDir, "spec-source", "enhanced_requirement_sections"),
           code_localization_file: join(sourceLoop.loopDir, "spec-code-localization.md"),
+          target_surfaces_file: join(sourceLoop.loopDir, "target-surfaces.json"),
+          target_surface_contract_file: join(sourceLoop.loopDir, "target-surface-contract.md"),
         },
         null,
         2,
@@ -367,6 +424,7 @@ Continue source changes.
       maxRounds: 1,
       opencodeCommand: "fake-opencode",
       maxInvocations: 1,
+      plannerBackend: "codex-cli",
       resumeLoopDir: sourceLoop.loopDir,
       resumeMode: "round0",
       planner() {
@@ -413,9 +471,79 @@ Continue source changes.
     expect(manifest).toContain('"planner_model": null')
     expect(existsSync(join(result.loopDir!, "spec-source", "enhanced_requirement_sections"))).toBe(true)
     expect(existsSync(join(result.loopDir!, "spec-code-localization.md"))).toBe(true)
+    expect(existsSync(join(result.loopDir!, "target-surface-contract.md"))).toBe(true)
+    expect(existsSync(join(result.loopDir!, "target-surfaces.json"))).toBe(true)
     expect(calls[0]?.input).toContain("Spec input manifest")
     expect(calls[0]?.input).toContain("Spec evidence directory")
     expect(calls[0]?.input).toContain("Spec code localization")
+    expect(calls[0]?.input).toContain("Target surface contract")
+    expect(calls[0]?.input).toContain("Hard Target Surface Completion Gate")
+  })
+
+  test("OpenCode planner and reviewer backends use explicit models and agents", () => {
+    const project = tempGitProject()
+    const calls: Array<{ args: string[]; input: string }> = []
+    let loopDir = ""
+
+    const result = runPactDriver({
+      projectRoot: project,
+      planFile: join(project, "plan.md"),
+      model: "openrouter/z-ai/glm-5.2",
+      maxRounds: 1,
+      opencodeCommand: "fake-opencode",
+      maxInvocations: 1,
+      plannerBackend: "opencode-cli",
+      plannerAgent: "pact-planner",
+      plannerModel: "openrouter/z-ai/glm-5.2",
+      reviewerBackend: "opencode-cli",
+      reviewerAgent: "pact-reviewer",
+      reviewerModel: "openrouter/z-ai/glm-5.2",
+      workerAgent: "pact-worker",
+      spawnSync(_command, args, options) {
+        calls.push({ args, input: options.input })
+        if (calls.length === 1) {
+          return { status: 0, stdout: validPlannerOutput(), stderr: "" }
+        }
+        if (calls.length === 2) {
+          loopDir = join(project, ".pact", "loops", "missing")
+          appendFileSync(join(project, "src.txt"), "worker change\n", "utf-8")
+          return { status: 0, stdout: "worker\n", stderr: "" }
+        }
+        return { status: 0, stdout: "### Decision Summary\nContinue.\n", stderr: "" }
+      },
+    })
+
+    expect(result.status).toBe("stopped")
+    expect(calls[0]?.args).toEqual([
+      "run",
+      "--dangerously-skip-permissions",
+      "-m",
+      "openrouter/z-ai/glm-5.2",
+      "--agent",
+      "pact-planner",
+    ])
+    expect(calls[1]?.args).toEqual([
+      "run",
+      "--dangerously-skip-permissions",
+      "-m",
+      "openrouter/z-ai/glm-5.2",
+      "--agent",
+      "pact-worker",
+    ])
+    expect(calls[2]?.args).toEqual([
+      "run",
+      "--dangerously-skip-permissions",
+      "-m",
+      "openrouter/z-ai/glm-5.2",
+      "--agent",
+      "pact-reviewer",
+    ])
+    expect(JSON.parse(readFileSync(join(result.loopDir!, "round-01-result.json"), "utf-8"))).toMatchObject({
+      planner_backend: "opencode-cli",
+      planner_model: "openrouter/z-ai/glm-5.2",
+      reviewer_backend: "opencode-cli",
+      reviewer_model: "openrouter/z-ai/glm-5.2",
+    })
   })
 
   test("docker worker runner wraps each OpenCode round in a container", () => {
@@ -427,12 +555,16 @@ Continue source changes.
     const oldConfig = process.env.OPENCODE_CONFIG_CONTENT
     const oldZaiKey = process.env.ZAI_API_KEY
     const oldZaiBase = process.env.ZAI_API_BASE
+    const oldOpenRouterKey = process.env.OPENROUTER_API_KEY
+    const oldOpenRouterBase = process.env.OPENROUTER_BASE_URL
     const oldOpencodeConfig = process.env.OPENCODE_CONFIG
     const oldMem = process.env.LOLBENCH_MEM
     const oldCpus = process.env.LOLBENCH_CPUS
     process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ plugin: [pluginPath] })
     process.env.ZAI_API_KEY = "test-zai-key"
     process.env.ZAI_API_BASE = "https://api.z.ai/api/coding/paas/v4"
+    process.env.OPENROUTER_API_KEY = "test-openrouter-key"
+    process.env.OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
     process.env.OPENCODE_CONFIG = "/root/.config/opencode/opencode.json"
     process.env.LOLBENCH_MEM = "7g"
     process.env.LOLBENCH_CPUS = "4"
@@ -478,6 +610,8 @@ Continue source changes.
       expect(entrypointIndex).toBeGreaterThan(-1)
       expect(calls[0]?.args[entrypointIndex + 1]).toBe("")
       expect(calls[0]?.args).toContain("ZAI_API_KEY")
+      expect(calls[0]?.args).toContain("OPENROUTER_API_KEY")
+      expect(calls[0]?.args).toContain("OPENROUTER_BASE_URL")
       expect(calls[0]?.args).toContain("OPENCODE_CONFIG")
       const configArg = calls[0]?.args.find((arg) => arg.startsWith("OPENCODE_CONFIG_CONTENT=")) ?? ""
       expect(configArg).toContain("/opt/opencode-pact-plugins/pact.ts")
@@ -501,6 +635,10 @@ Continue source changes.
       else process.env.ZAI_API_KEY = oldZaiKey
       if (oldZaiBase === undefined) delete process.env.ZAI_API_BASE
       else process.env.ZAI_API_BASE = oldZaiBase
+      if (oldOpenRouterKey === undefined) delete process.env.OPENROUTER_API_KEY
+      else process.env.OPENROUTER_API_KEY = oldOpenRouterKey
+      if (oldOpenRouterBase === undefined) delete process.env.OPENROUTER_BASE_URL
+      else process.env.OPENROUTER_BASE_URL = oldOpenRouterBase
       if (oldOpencodeConfig === undefined) delete process.env.OPENCODE_CONFIG
       else process.env.OPENCODE_CONFIG = oldOpencodeConfig
       if (oldMem === undefined) delete process.env.LOLBENCH_MEM

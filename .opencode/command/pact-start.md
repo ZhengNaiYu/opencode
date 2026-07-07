@@ -29,4 +29,11 @@ Defaults:
 - `worker_config_source=mini-swe-agent-env`
 - `full_alignment_interval=5`
 
+Planner/reviewer backend notes:
+
+- `codex-cli` remains the default for planner and reviewer.
+- `opencode-agent` runs planner/reviewer through OpenCode agents, so model names should use OpenCode-native provider-qualified forms such as `openrouter/...`.
+- OpenRouter is not a PACT backend; it is only a provider/API-key source used by OpenCode or Codex model configuration.
+- Worker models still run through OpenCode. Use OpenCode-native worker model names such as `openrouter/...` or `zai-coding-plan/...` as appropriate.
+
 If no plan file is provided, ask the user for one. Otherwise call `pact-start-loop` with the parsed arguments.

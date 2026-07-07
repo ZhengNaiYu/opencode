@@ -140,11 +140,9 @@ export const PactPlugin: Plugin = async ({ client, directory, worktree }, option
         },
         async execute(args, context) {
           const plannerBackend = args.planner_backend ?? cfg.plannerBackend
-          const plannerModel =
-            plannerBackend === "codex-cli" ? args.planner_model ?? plannerModelForBackend(plannerBackend, cfg) : null
+          const plannerModel = args.planner_model ?? plannerModelForBackend(plannerBackend, cfg)
           const reviewerBackend = args.reviewer_backend ?? cfg.reviewerBackend
-          const reviewerModel =
-            reviewerBackend === "codex-cli" ? args.reviewer_model ?? reviewerModelForBackend(reviewerBackend, cfg) : null
+          const reviewerModel = args.reviewer_model ?? reviewerModelForBackend(reviewerBackend, cfg)
           const workerBackend = args.worker_backend ?? cfg.workerBackend ?? PACT_PLUGIN_DEFAULTS.workerBackend
           const workerModel = args.worker_model ?? cfg.workerModel ?? PACT_PLUGIN_DEFAULTS.workerModel
           const workerConfigSource =
@@ -617,7 +615,8 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
             workingState.reviewer_backend === "codex-cli"
               ? invokeCodexReviewer(reviewPrompt, { ...cfg, reviewerModel: reviewerModel ?? undefined }, projectRoot)
               : await invokeOpenCodeAgent(promptClient, {
-                  agent: cfg.reviewerAgent,
+                  agent: cfg.reviewerAgent ?? PACT_PLUGIN_DEFAULTS.reviewerAgent,
+                  model: reviewerModel,
                   title: `PACT review round ${roundName(round)}`,
                   prompt: reviewPrompt,
                   parentSessionID: workingState.active_session_id,
@@ -1922,6 +1921,7 @@ async function invokePlannerBackend(input: {
   }
   return invokeOpenCodeAgent(input.client, {
     agent: input.cfg.plannerAgent ?? PACT_PLUGIN_DEFAULTS.plannerAgent,
+    model: input.plannerModel,
     title: "PACT planner",
     prompt: input.prompt,
     parentSessionID: input.parentSessionID,
@@ -2016,12 +2016,13 @@ function verificationConfigForState(state: PactState, cfg: PactPluginOptions): P
 }
 
 function plannerModelForBackend(backend: PlannerBackend, cfg: PactPluginOptions): string | null {
-  if (backend !== "codex-cli") return null
+  if (backend === "spec-import") return null
+  if (backend !== "codex-cli") return cfg.plannerModel ?? PACT_PLUGIN_DEFAULTS.plannerModel
   return codexModelFromArgs(cfg.plannerCodexArgs) ?? cfg.plannerModel ?? PACT_PLUGIN_DEFAULTS.plannerModel
 }
 
 function reviewerModelForBackend(backend: ReviewerBackend, cfg: PactPluginOptions): string | null {
-  if (backend !== "codex-cli") return null
+  if (backend !== "codex-cli") return cfg.reviewerModel ?? PACT_PLUGIN_DEFAULTS.reviewerModel
   return codexModelFromArgs(cfg.codexArgs) ?? cfg.reviewerModel ?? PACT_PLUGIN_DEFAULTS.reviewerModel
 }
 
@@ -2053,13 +2054,14 @@ function safeUnknownText(value: unknown): string {
 
 async function invokeOpenCodeAgent(
   client: PromptClient,
-  input: { agent: string; title: string; prompt: string; parentSessionID?: string },
+  input: { agent: string; model?: string | null; title: string; prompt: string; parentSessionID?: string },
 ): Promise<string> {
   if (!client.session?.create || !client.session?.prompt) {
     throw new Error("OpenCode client session API is unavailable")
   }
+  const model = openCodeModelRef(input.model)
   const created = await client.session.create({
-    body: { parentID: input.parentSessionID, title: input.title },
+    body: { parentID: input.parentSessionID, title: input.title, ...(model ? { model } : {}) },
   })
   const sessionID = created.data?.id
   if (!sessionID) throw new Error(`Failed to create ${input.agent} session`)
@@ -2067,10 +2069,18 @@ async function invokeOpenCodeAgent(
     path: { id: sessionID },
     body: {
       agent: input.agent,
+      ...(model ? { model } : {}),
       parts: [{ type: "text", text: input.prompt }],
     },
   })
   return extractTextParts(result)
+}
+
+function openCodeModelRef(model: string | null | undefined): { providerID: string; id: string } | undefined {
+  if (!model) return undefined
+  const slash = model.indexOf("/")
+  if (slash <= 0 || slash === model.length - 1) return undefined
+  return { providerID: model.slice(0, slash), id: model.slice(slash + 1) }
 }
 
 async function promptSession(client: PromptClient, sessionID: string, agent: string, prompt: string): Promise<void> {

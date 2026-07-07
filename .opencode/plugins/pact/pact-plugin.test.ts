@@ -198,12 +198,22 @@ Canonicalize the LoLBench task before implementation.
 `
 }
 
-function fakeClient(output = ""): { client: any; prompts: Array<Record<string, any>> } {
+function fakeClient(output = ""): {
+  client: any
+  creates: Array<Record<string, any>>
+  prompts: Array<Record<string, any>>
+} {
+  const creates: Array<Record<string, any>> = []
   const prompts: Array<Record<string, any>> = []
   return {
+    creates,
     prompts,
     client: {
       session: {
+        async create(input: Record<string, any>) {
+          creates.push(input)
+          return { data: { id: `ses_created_${creates.length}` } }
+        },
         async prompt(input: Record<string, any>) {
           prompts.push(input)
           return { data: { parts: [{ type: "text", text: output }] } }
@@ -316,12 +326,14 @@ describe("PACT Codex planner and reviewer", () => {
     expect(readFileSync(join(loopDir, ".round-history", "artifacts", "plan.md"), "utf-8")).toBe(canonicalPlan)
   })
 
-  test("opencode-agent planner and reviewer do not record codex default model names", async () => {
+  test("opencode-agent planner records and passes explicit OpenCode model refs", async () => {
     const project = tempGitProject()
-    const { client } = fakeClient(validPlannerOutput())
+    const { client, creates, prompts } = fakeClient(validPlannerOutput())
     const hooks = await PactPlugin({ client, directory: project, worktree: project } as any, {
       plannerBackend: "opencode-agent",
+      plannerModel: "openrouter/z-ai/glm-5.2",
       reviewerBackend: "opencode-agent",
+      reviewerModel: "openrouter/z-ai/glm-5.2",
     })
 
     const result = (await hooks.tool?.["pact-start-loop"].execute(
@@ -337,19 +349,26 @@ describe("PACT Codex planner and reviewer", () => {
     )) as { metadata: { loopDir: string; plannerModel: string | null; reviewerModel: string | null } }
     const loopDir = result.metadata.loopDir
 
-    expect(result.metadata.plannerModel).toBeNull()
-    expect(result.metadata.reviewerModel).toBeNull()
+    expect(result.metadata.plannerModel).toBe("openrouter/z-ai/glm-5.2")
+    expect(result.metadata.reviewerModel).toBe("openrouter/z-ai/glm-5.2")
     expect(readState(loopDir)).toMatchObject({
       planner_backend: "opencode-agent",
-      planner_model: null,
+      planner_model: "openrouter/z-ai/glm-5.2",
       reviewer_backend: "opencode-agent",
-      reviewer_model: null,
+      reviewer_model: "openrouter/z-ai/glm-5.2",
     })
     expect(JSON.parse(readFileSync(join(loopDir, "loop-manifest.json"), "utf-8"))).toMatchObject({
       planner_backend: "opencode-agent",
-      planner_model: null,
+      planner_model: "openrouter/z-ai/glm-5.2",
       reviewer_backend: "opencode-agent",
-      reviewer_model: null,
+      reviewer_model: "openrouter/z-ai/glm-5.2",
+    })
+    expect(creates[0]?.body).toMatchObject({
+      model: { providerID: "openrouter", id: "z-ai/glm-5.2" },
+    })
+    expect(prompts[0]?.body).toMatchObject({
+      agent: "pact-planner",
+      model: { providerID: "openrouter", id: "z-ai/glm-5.2" },
     })
   })
 

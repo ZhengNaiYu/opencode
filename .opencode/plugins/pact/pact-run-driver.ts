@@ -93,9 +93,12 @@ export function buildPactStartPrompt(input: {
   planFile: string
   maxRounds: number
   plannerBackend?: string
+  plannerAgent?: string
   plannerModel?: string
   reviewerBackend?: string
+  reviewerAgent?: string
   reviewerModel?: string
+  workerAgent?: string
   workerModel: string
   fullAlignmentInterval?: number
   sessionStrategy?: SessionStrategy
@@ -111,10 +114,13 @@ export function buildPactStartPrompt(input: {
 - plan_file="${input.planFile}"
 - max_rounds=${input.maxRounds}
 - planner_backend=${input.plannerBackend ?? "codex-cli"}
+- planner_agent=${input.plannerAgent ?? "pact-planner"}
 - planner_model=${input.plannerModel ?? "gpt-5.5"}
 - reviewer_backend=${input.reviewerBackend ?? "codex-cli"}
+- reviewer_agent=${input.reviewerAgent ?? "pact-reviewer"}
 - reviewer_model=${input.reviewerModel ?? "gpt-5.4-mini"}
 - worker_backend=opencode-cli
+- worker_agent=${input.workerAgent ?? "pact-worker"}
 - worker_model=${input.workerModel}
 - worker_config_source=mini-swe-agent-env
 - session_strategy=${input.sessionStrategy ?? "new-per-round"}
@@ -136,6 +142,9 @@ export function runPactDriver(input: {
   dockerCommand?: string
   containerOpencodeCommand?: string
   agent?: string
+  plannerAgent?: string
+  reviewerAgent?: string
+  workerAgent?: string
   variant?: string
   workerRunner?: WorkerRunner
   workerContainerImage?: string
@@ -177,6 +186,8 @@ export function runPactDriver(input: {
     plannerModel: input.plannerModel ?? "gpt-5.5",
     reviewerBackend: input.reviewerBackend ?? "codex-cli",
     reviewerModel: input.reviewerModel ?? "gpt-5.4-mini",
+    plannerAgent: input.plannerAgent ?? "pact-planner",
+    reviewerAgent: input.reviewerAgent ?? "pact-reviewer",
     workerModel: input.model,
     workerConfigSource: "mini-swe-agent-env",
     fullAlignmentInterval: input.fullAlignmentInterval,
@@ -185,6 +196,8 @@ export function runPactDriver(input: {
     verificationTimeoutMs: input.verificationTimeoutMs,
     resumeLoopDir: input.resumeLoopDir,
     resumeMode: input.resumeMode,
+    opencodeCommand: input.opencodeCommand ?? "opencode",
+    spawnSync: spawn,
     planner: input.planner,
   })
   let loopDir = initialized.loopDir
@@ -210,7 +223,7 @@ export function runPactDriver(input: {
     markWorkerRoundAttempted(loopDir, invokedRound)
     const opencodeArgs = buildOpencodeRunArgs({
       model: input.model,
-      agent: input.agent,
+      agent: input.workerAgent ?? input.agent,
       variant: input.variant,
       sessionID: sessionStrategy === "same-session" ? sessionID : undefined,
     })
@@ -262,7 +275,10 @@ export function runPactDriver(input: {
       loopDir,
       round: invokedRound,
       reviewer: input.reviewer,
-      agent: input.agent,
+      opencodeCommand: input.opencodeCommand ?? "opencode",
+      spawnSync: spawn,
+      reviewerAgent: input.reviewerAgent ?? "pact-reviewer",
+      agent: input.workerAgent ?? input.agent,
       model: input.model,
     })
     if (state.status !== "running") {
@@ -302,6 +318,8 @@ function initializeDriverLoop(input: {
   plannerModel: string | null
   reviewerBackend: ReviewerBackend
   reviewerModel: string | null
+  plannerAgent: string
+  reviewerAgent: string
   workerModel: string
   workerConfigSource?: string
   fullAlignmentInterval?: number
@@ -310,6 +328,8 @@ function initializeDriverLoop(input: {
   verificationTimeoutMs?: number
   resumeLoopDir?: string
   resumeMode?: ResumeMode
+  opencodeCommand: string
+  spawnSync: SpawnSyncLike
   planner?: DriverPlanner
 }): { loopDir: string; state: PactState } {
   if (input.resumeLoopDir) {
@@ -343,6 +363,10 @@ function initializeDriverLoop(input: {
       planFile: input.planFile,
       state: readState(loop.loopDir),
       model: input.plannerModel ?? "gpt-5.5",
+      backend: input.plannerBackend,
+      agent: input.plannerAgent,
+      opencodeCommand: input.opencodeCommand,
+      spawnSync: input.spawnSync,
       planner: input.planner,
       repair: false,
     })
@@ -362,6 +386,10 @@ function initializeDriverLoop(input: {
         planFile: input.planFile,
         state: readState(loop.loopDir),
         model: input.plannerModel ?? "gpt-5.5",
+        backend: input.plannerBackend,
+        agent: input.plannerAgent,
+        opencodeCommand: input.opencodeCommand,
+        spawnSync: input.spawnSync,
         planner: input.planner,
         repair: true,
       })
@@ -442,6 +470,7 @@ function initializeDriverLoopFromRound0(input: {
   const loopDir = allocateResumeLoopDir(input.projectRoot, sourceLoopID)
   const loopID = basename(loopDir)
   copyRound0ResumePackage(sourceLoopDir, loopDir)
+  rewriteResumeSpecInputManifest(loopDir)
 
   const now = new Date().toISOString()
   const state: PactState = {
@@ -562,6 +591,12 @@ function copyRound0ResumePackage(sourceLoopDir: string, targetLoopDir: string): 
       fileName === "plan.md" ||
       fileName === "todo.md" ||
       fileName === "goal-tracker.md" ||
+      fileName === "target-surface-contract.md" ||
+      fileName === "target-surfaces.json" ||
+      fileName === "behavioral-contract.md" ||
+      fileName === "coverage-obligation.json" ||
+      fileName === "ultimate-goal-checklist.json" ||
+      fileName === "reviewer-audit-checklist.md" ||
       fileName.startsWith("spec-") ||
       fileName.startsWith("round-00-")
     ) {
@@ -569,6 +604,58 @@ function copyRound0ResumePackage(sourceLoopDir: string, targetLoopDir: string): 
     }
   }
   copyFileSync(join(sourceLoopDir, "loop-manifest.json"), join(targetLoopDir, "resume-source-loop-manifest.json"))
+}
+
+function rewriteResumeSpecInputManifest(loopDir: string): void {
+  const manifestPath = join(loopDir, "spec-input-manifest.json")
+  if (!existsSync(manifestPath)) return
+  let manifest: Record<string, unknown>
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, "utf-8"))
+  } catch {
+    return
+  }
+  const evidenceDir = join(loopDir, "spec-source", "enhanced_requirement_sections")
+  manifest.copied_evidence_dir = evidenceDir
+  if (existsSync(join(loopDir, "spec-code-localization.md"))) {
+    manifest.code_localization_file = join(loopDir, "spec-code-localization.md")
+  }
+  if (existsSync(join(loopDir, "target-surfaces.json"))) {
+    manifest.target_surfaces_file = join(loopDir, "target-surfaces.json")
+  }
+  if (existsSync(join(loopDir, "target-surface-contract.md"))) {
+    manifest.target_surface_contract_file = join(loopDir, "target-surface-contract.md")
+  }
+  if (existsSync(join(loopDir, "behavioral-contract.md"))) {
+    manifest.behavioral_contract_file = join(loopDir, "behavioral-contract.md")
+  }
+  if (existsSync(join(loopDir, "coverage-obligation.json"))) {
+    manifest.coverage_obligation_file = join(loopDir, "coverage-obligation.json")
+  }
+  if (existsSync(join(loopDir, "ultimate-goal-checklist.json"))) {
+    manifest.ultimate_goal_checklist_file = join(loopDir, "ultimate-goal-checklist.json")
+  }
+  if (existsSync(join(loopDir, "reviewer-audit-checklist.md"))) {
+    manifest.reviewer_audit_checklist_file = join(loopDir, "reviewer-audit-checklist.md")
+  }
+  if (manifest.core_sections && typeof manifest.core_sections === "object") {
+    const coreSections = manifest.core_sections as Record<string, unknown>
+    if (existsSync(join(loopDir, "spec-code-localization.md"))) {
+      coreSections.code_localization = join(loopDir, "spec-code-localization.md")
+    }
+  }
+  if (Array.isArray(manifest.section_files)) {
+    manifest.section_files = manifest.section_files.map((entry) => {
+      if (!entry || typeof entry !== "object") return entry
+      const record = entry as Record<string, unknown>
+      const sourcePath = typeof record.source_path === "string" ? record.source_path : undefined
+      const loopPath = typeof record.loop_path === "string" ? record.loop_path : undefined
+      const fileName = basename(sourcePath ?? loopPath ?? "")
+      if (!fileName) return record
+      return { ...record, loop_path: join(evidenceDir, fileName) }
+    })
+  }
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf-8")
 }
 
 function copyDirectory(sourceDir: string, targetDir: string): void {
@@ -606,6 +693,30 @@ function writeResumeManifest(input: {
     project_root: input.projectRoot,
     plan_file: input.planFile,
     source_plan_path: join(input.loopDir, "source-plan.md"),
+    copied_evidence_dir: existsSync(join(input.loopDir, "spec-source", "enhanced_requirement_sections"))
+      ? join(input.loopDir, "spec-source", "enhanced_requirement_sections")
+      : undefined,
+    code_localization_file: existsSync(join(input.loopDir, "spec-code-localization.md"))
+      ? join(input.loopDir, "spec-code-localization.md")
+      : undefined,
+    target_surfaces_file: existsSync(join(input.loopDir, "target-surfaces.json"))
+      ? join(input.loopDir, "target-surfaces.json")
+      : undefined,
+    target_surface_contract_file: existsSync(join(input.loopDir, "target-surface-contract.md"))
+      ? join(input.loopDir, "target-surface-contract.md")
+      : undefined,
+    behavioral_contract_file: existsSync(join(input.loopDir, "behavioral-contract.md"))
+      ? join(input.loopDir, "behavioral-contract.md")
+      : undefined,
+    coverage_obligation_file: existsSync(join(input.loopDir, "coverage-obligation.json"))
+      ? join(input.loopDir, "coverage-obligation.json")
+      : undefined,
+    ultimate_goal_checklist_file: existsSync(join(input.loopDir, "ultimate-goal-checklist.json"))
+      ? join(input.loopDir, "ultimate-goal-checklist.json")
+      : undefined,
+    reviewer_audit_checklist_file: existsSync(join(input.loopDir, "reviewer-audit-checklist.md"))
+      ? join(input.loopDir, "reviewer-audit-checklist.md")
+      : undefined,
     resume_mode: "round0",
     resume_source_loop: input.sourceLoopDir,
     resume_source_loop_id: input.sourceLoopID,
@@ -645,6 +756,10 @@ function invokeDriverPlanner(
     planFile: string
     state: PactState
     model: string
+    backend: PlannerBackend
+    agent: string
+    opencodeCommand: string
+    spawnSync: SpawnSyncLike
     planner?: DriverPlanner
     repair: boolean
   },
@@ -658,7 +773,75 @@ function invokeDriverPlanner(
       repair: input.repair,
     })
   }
-  return invokeDriverCodexPlanner(prompt, input.projectRoot, input.model)
+  if (input.backend === "opencode-cli") {
+    return invokeDriverOpenCodeAgent(prompt, {
+      role: "planner",
+      projectRoot: input.projectRoot,
+      command: input.opencodeCommand,
+      agent: input.agent,
+      model: input.model,
+      spawnSync: input.spawnSync,
+    })
+  }
+  if (input.backend === "codex-cli") return invokeDriverCodexPlanner(prompt, input.projectRoot, input.model)
+  throw new Error(`Unsupported standalone PACT planner backend: ${input.backend}`)
+}
+
+function invokeDriverOpenCodeAgent(
+  prompt: string,
+  input: {
+    role: "planner" | "reviewer"
+    projectRoot: string
+    command: string
+    agent: string
+    model: string
+    spawnSync: SpawnSyncLike
+  },
+): string {
+  const args = buildOpencodeRunArgs({ model: input.model, agent: input.agent })
+  const result = input.spawnSync(input.command, args, {
+    cwd: input.projectRoot,
+    input: prompt,
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
+    maxBuffer: OPENCODE_RUN_MAX_BUFFER,
+  })
+  if (result.error) throw result.error
+  if (result.status !== 0) {
+    throw new Error(
+      formatOpenCodeFailure({
+        command: input.command,
+        args,
+        result,
+      }),
+    )
+  }
+  return result.stdout || result.stderr || `OpenCode ${input.role} returned no content.`
+}
+
+function invokeDriverReviewer(
+  prompt: string,
+  input: {
+    projectRoot: string
+    backend: ReviewerBackend
+    model: string
+    agent: string
+    opencodeCommand: string
+    spawnSync: SpawnSyncLike
+  },
+): string {
+  if (input.backend === "opencode-cli") {
+    return invokeDriverOpenCodeAgent(prompt, {
+      role: "reviewer",
+      projectRoot: input.projectRoot,
+      command: input.opencodeCommand,
+      agent: input.agent,
+      model: input.model,
+      spawnSync: input.spawnSync,
+    })
+  }
+  if (input.backend === "codex-cli") return invokeDriverCodexReviewer(prompt, input.projectRoot, input.model)
+  throw new Error(`Unsupported standalone PACT reviewer backend: ${input.backend}`)
 }
 
 function recordDriverPlannerFailure(input: {
@@ -746,6 +929,9 @@ function finalizeRoundAfterRunExit(input: {
   loopDir: string
   round: number
   reviewer?: DriverReviewer
+  opencodeCommand: string
+  spawnSync: SpawnSyncLike
+  reviewerAgent: string
   agent?: string
   model: string
 }): PactState {
@@ -873,10 +1059,18 @@ function finalizeRoundAfterRunExit(input: {
     reviewText =
       input.reviewer?.(reviewPrompt, {
         projectRoot: input.projectRoot,
-        loopDir: input.loopDir,
-        round: input.round,
-        state: initialState,
-      }) ?? invokeDriverCodexReviewer(reviewPrompt, input.projectRoot, initialState.reviewer_model ?? "gpt-5.4-mini")
+      loopDir: input.loopDir,
+      round: input.round,
+      state: initialState,
+    }) ??
+      invokeDriverReviewer(reviewPrompt, {
+        projectRoot: input.projectRoot,
+        backend: initialState.reviewer_backend,
+        model: initialState.reviewer_model ?? "gpt-5.4-mini",
+        agent: input.reviewerAgent,
+        opencodeCommand: input.opencodeCommand,
+        spawnSync: input.spawnSync,
+      })
   } catch (err) {
     const decision = recordFailedReviewDecision({
       loopDir: input.loopDir,
@@ -1136,7 +1330,12 @@ function writeNextPromptAfterDriverRound(input: {
   const goalTrackerPath = join(input.loopDir, "goal-tracker.md")
   let prompt: string | undefined
   if (input.state.phase === "finalize") {
-    prompt = buildFinalizePrompt({ loopDir: input.loopDir, round: input.state.current_round, goalTrackerPath, workerPath })
+    prompt = buildFinalizePrompt({
+      loopDir: input.loopDir,
+      round: input.state.current_round,
+      goalTrackerPath,
+      workerPath,
+    })
   } else if (input.state.phase === "review") {
     prompt = buildReviewPhasePrompt({
       loopDir: input.loopDir,
@@ -1806,7 +2005,14 @@ function dockerResourceArgs(): string[] {
 
 function dockerWorkerEnvArgs(input: { workerPluginMount?: string; workerContainerPluginMount: string }): string[] {
   const args: string[] = []
-  for (const name of ["ZAI_API_KEY", "ZAI_API_BASE", "OPENCODE_CONFIG", "MSWEA_MODEL_NAME"]) {
+  for (const name of [
+    "ZAI_API_KEY",
+    "ZAI_API_BASE",
+    "OPENROUTER_API_KEY",
+    "OPENROUTER_BASE_URL",
+    "OPENCODE_CONFIG",
+    "MSWEA_MODEL_NAME",
+  ]) {
     if (env[name]) args.push("-e", name)
   }
   const config = containerOpenCodeConfig(input)
@@ -1893,12 +2099,17 @@ export function cliArgs(raw: string[]): {
   dockerCommand?: string
   containerOpencodeCommand?: string
   agent?: string
+  plannerAgent?: string
+  reviewerAgent?: string
+  workerAgent?: string
   variant?: string
   workerRunner?: WorkerRunner
   workerContainerImage?: string
   workerContainerWorkspace?: string
   workerPluginMount?: string
   workerContainerPluginMount?: string
+  plannerBackend?: PlannerBackend
+  reviewerBackend?: ReviewerBackend
   plannerModel?: string
   reviewerModel?: string
   fullAlignmentInterval?: number
@@ -1926,13 +2137,18 @@ export function cliArgs(raw: string[]): {
     opencodeCommand: parsed["opencode-command"],
     dockerCommand: parsed["docker-command"],
     containerOpencodeCommand: parsed["container-opencode-command"],
-    agent: parsed.agent,
+    agent: parsed["worker-agent"] ?? parsed.agent,
+    plannerAgent: parsed["planner-agent"],
+    reviewerAgent: parsed["reviewer-agent"],
+    workerAgent: parsed["worker-agent"] ?? parsed.agent,
     variant: parsed.variant,
     workerRunner: (parsed["worker-runner"] ?? env.PACT_WORKER_RUNNER) === "docker" ? "docker" : "host",
     workerContainerImage: parsed["worker-container-image"] ?? env.LOLBENCH_AGENT_IMAGE_TAG,
     workerContainerWorkspace: parsed["worker-container-workspace"],
     workerPluginMount: parsed["worker-plugin-mount"],
     workerContainerPluginMount: parsed["worker-container-plugin-mount"],
+    plannerBackend: parsePlannerBackend(parsed["planner-backend"] ?? parsed.planner),
+    reviewerBackend: parseReviewerBackend(parsed["reviewer-backend"] ?? parsed.reviewer),
     plannerModel: parsed["planner-model"],
     reviewerModel: parsed["reviewer-model"],
     verificationCommand: defaultVerificationCommand(parsed),
@@ -1942,6 +2158,18 @@ export function cliArgs(raw: string[]): {
     sessionStrategy: parsed["session-strategy"] === "same-session" ? "same-session" : "new-per-round",
     fullAlignmentInterval: parsed["full-alignment-interval"] ? Number(parsed["full-alignment-interval"]) : undefined,
   }
+}
+
+function parsePlannerBackend(value: string | undefined): PlannerBackend | undefined {
+  if (value === undefined || value === "") return undefined
+  if (value === "opencode-cli" || value === "codex-cli") return value
+  throw new Error(`Unsupported PACT planner backend: ${value}`)
+}
+
+function parseReviewerBackend(value: string | undefined): ReviewerBackend | undefined {
+  if (value === undefined || value === "") return undefined
+  if (value === "opencode-cli" || value === "codex-cli") return value
+  throw new Error(`Unsupported PACT reviewer backend: ${value}`)
 }
 
 function parseResumeMode(value: string | undefined): ResumeMode | undefined {
