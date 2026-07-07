@@ -29,6 +29,7 @@ import {
   parseReviewDecision,
   readState,
   recordReviewDecision,
+  redactText,
   writeContinuationPackage,
   writeVerificationArtifact,
   extractPatchChangedPaths,
@@ -114,6 +115,23 @@ describe("artifact helpers", () => {
 
     expect(readFileSync(jsonPath, "utf-8")).toBe('{\n  "z": 1,\n  "a": true\n}\n')
     expect(readFileSync(jsonlPath, "utf-8")).toBe('{"event":"first"}\n{"event":"second"}\n')
+  })
+
+  test("redacts configured API key values and bearer tokens", () => {
+    const oldKey = process.env.OPENROUTER_API_KEY
+    process.env.OPENROUTER_API_KEY = "or-test-secret-value-123456"
+    try {
+      const redacted = redactText(
+        "Authorization: Bearer or-test-secret-value-123456\nOPENROUTER_API_KEY=or-test-secret-value-123456\nbody mentions or-test-secret-value-123456",
+      )
+
+      expect(redacted).toContain("Bearer [REDACTED]")
+      expect(redacted).toContain("OPENROUTER_API_KEY=[REDACTED]")
+      expect(redacted).not.toContain("or-test-secret-value-123456")
+    } finally {
+      if (oldKey === undefined) delete process.env.OPENROUTER_API_KEY
+      else process.env.OPENROUTER_API_KEY = oldKey
+    }
   })
 
   test("writes verification and continuation package artifacts", () => {
@@ -873,6 +891,101 @@ describe("worker prompt shape", () => {
       expect(prompt).not.toContain("goes idle")
     }
     expect(initial).toContain("when this bounded run ends")
+  })
+
+  test("worker and reviewer prompts treat target surface contracts as hard completion gates", () => {
+    const project = tempProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
+    writeFileSync(join(loop.loopDir, "target-surface-contract.md"), "# Target Surface Contract\n", "utf-8")
+    writeFileSync(join(loop.loopDir, "target-surfaces.json"), '{"schema":"pact-target-surfaces/v1","surfaces":[]}\n', "utf-8")
+
+    const initial = buildInitialWorkerPrompt({
+      loopDir: loop.loopDir,
+      round: 1,
+      todoPath: join(loop.loopDir, "todo.md"),
+      goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+    })
+    const continuation = buildContinuationPrompt({
+      loopDir: loop.loopDir,
+      round: 2,
+      feedbackPath: join(loop.loopDir, "round-01-feedback.md"),
+      goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+    })
+    const review = buildReviewPrompt({
+      loopDir: loop.loopDir,
+      round: 1,
+      summaryPath: join(loop.loopDir, "round-01-summary.md"),
+      summary: "Changed files: src.py\n",
+    })
+
+    for (const prompt of [initial, continuation]) {
+      expect(prompt).toContain("Target surface contract:")
+      expect(prompt).toContain("Hard Target Surface Completion Gate")
+      expect(prompt).toContain("CHANGED")
+      expect(prompt).toContain("BASE_PROVEN_EQUIVALENT")
+      expect(prompt).not.toContain("JUSTIFIED_NO_DIFF")
+    }
+    expect(review).toContain("Target surface contract:")
+    expect(review).toContain("Target Surface Audit")
+    expect(review).toContain("Do not write PACT_COMPLETE while any hard High target surface is MISSING or unproven")
+  })
+
+  test("worker and reviewer prompts keep behavioral obligations live across rounds", () => {
+    const project = tempProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md" })
+    writeFileSync(join(loop.loopDir, "behavioral-contract.md"), "# Behavioral Contract\n- Runtime behavior\n", "utf-8")
+    writeFileSync(join(loop.loopDir, "reviewer-audit-checklist.md"), "# Reviewer Audit Checklist\n", "utf-8")
+    writeJsonFile(join(loop.loopDir, "coverage-obligation.json"), {
+      schema: "pact-coverage-obligation/v1",
+      obligations: [
+        {
+          id: "BO-001",
+          title: "Runtime behavior",
+          status: "UNVERIFIED",
+          source_refs: ["15_decomposed_requirements.md"],
+          target_surfaces: ["Lib/feature.py"],
+        },
+      ],
+    })
+    writeJsonFile(join(loop.loopDir, "ultimate-goal-checklist.json"), {
+      schema: "pact-ultimate-goal-checklist/v1",
+      checks: [{ id: "UG-001", title: "Runtime behavior", status: "UNVERIFIED" }],
+    })
+
+    const initial = buildInitialWorkerPrompt({
+      loopDir: loop.loopDir,
+      round: 1,
+      todoPath: join(loop.loopDir, "todo.md"),
+      goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+    })
+    const continuation = buildContinuationPrompt({
+      loopDir: loop.loopDir,
+      round: 2,
+      feedbackPath: join(loop.loopDir, "round-01-feedback.md"),
+      goalTrackerPath: join(loop.loopDir, "goal-tracker.md"),
+    })
+    const review = buildReviewPrompt({
+      loopDir: loop.loopDir,
+      round: 1,
+      summaryPath: join(loop.loopDir, "round-01-summary.md"),
+      summary: "Changed files: Lib/feature.py\n",
+    })
+
+    for (const prompt of [initial, continuation]) {
+      expect(prompt).toContain("Ultimate Goal Non-Negotiables")
+      expect(prompt).toContain("Behavioral Obligations Still Requiring Proof")
+      expect(prompt).toContain("Behavioral contract:")
+      expect(prompt).toContain("Coverage obligations:")
+      expect(prompt).toContain("What I fixed from reviewer feedback")
+      expect(prompt).toContain("What I re-audited from ultimate goal")
+      expect(prompt).toContain("Behavior obligations still unproven")
+      expect(prompt).toContain("Base-equivalence proof table")
+    }
+    expect(review).toContain("Behavioral contract:")
+    expect(review).toContain("Coverage obligations:")
+    expect(review).toContain("Behavioral Contract Audit")
+    expect(review).toContain("Base-Equivalence Proof Audit")
+    expect(review).toContain("Complete Decision Evidence")
   })
 
   test("worker prompts can render workspace-relative artifact paths for container-visible workers", () => {
@@ -1804,6 +1917,55 @@ PACT_COMPLETE
       blocked_by: "build_gate",
       parse_status: "build_gate_failed",
       verification_ref: artifactPaths(loop.loopDir, 1).verification,
+    })
+  })
+
+  test("forces reviewer complete to continue when behavioral obligations are unproven", () => {
+    const project = tempProject()
+    const loop = createLoop({ projectRoot: project, planFile: "plan.md", maxRounds: 3 })
+    writeJsonFile(join(loop.loopDir, "coverage-obligation.json"), {
+      schema: "pact-coverage-obligation/v1",
+      obligations: [
+        {
+          id: "BO-001",
+          title: "Runtime behavior",
+          status: "UNVERIFIED",
+          source_refs: ["15_decomposed_requirements.md"],
+          target_surfaces: ["Lib/feature.py"],
+        },
+      ],
+    })
+
+    const decision = recordReviewDecision({
+      loopDir: loop.loopDir,
+      round: 1,
+      reviewText: `### Decision Summary
+Looks complete from the worker summary.
+
+PACT_COMPLETE
+`,
+    })
+
+    expect(decision).toMatchObject({
+      marker: "continue",
+      parseStatus: "behavior_obligation_failed",
+      terminalLine: "PACT_COMPLETE",
+    })
+    expect(readState(loop.loopDir)).toMatchObject({
+      status: "running",
+      phase: "implementation",
+      current_round: 2,
+    })
+    const feedback = readFileSync(join(loop.loopDir, "round-01-feedback.md"), "utf-8")
+    expect(feedback).toContain("Behavioral obligation completion gate failed")
+    expect(feedback).toContain("BO-001")
+    expect(feedback).toContain("Behavioral Contract Audit")
+    expect(JSON.parse(readFileSync(join(loop.loopDir, "round-01-review-decision.json"), "utf-8"))).toMatchObject({
+      marker: "continue",
+      raw_marker: "complete",
+      accepted: false,
+      blocked_by: "behavior_obligation",
+      parse_status: "behavior_obligation_failed",
     })
   })
 })

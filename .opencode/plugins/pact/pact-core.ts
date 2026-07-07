@@ -158,6 +158,7 @@ export type ReviewDecision = {
     | "reviewer_failed"
     | "patch_apply_failed"
     | "build_gate_failed"
+    | "behavior_obligation_failed"
   terminalLine: string
 }
 
@@ -444,7 +445,7 @@ export type ReviewDecisionArtifact = {
   feedback_path?: string
   raw_marker?: ReviewMarker
   accepted?: boolean
-  blocked_by?: "patch_apply" | "build_gate"
+  blocked_by?: "patch_apply" | "build_gate" | "behavior_obligation"
   verification_ref?: string
   reviewer_backend?: ReviewerBackend
   reviewer_model?: string | null
@@ -1320,6 +1321,7 @@ function buildCurrentStateSnapshot(input: {
   const goalTrackerText = existsSync(goalTrackerPath) ? readFileSync(goalTrackerPath, "utf-8") : ""
   const reviewerGuidance = reviewerGuidanceSnapshot(input.reviewText ?? "", input.reviewGuidance)
   const reviewStatusDelta = input.reviewStatusDelta ?? extractReviewStatusDelta(input.reviewText ?? "")
+  const behaviorSnapshot = behaviorObligationSnapshot(input.loopDir)
 
   return [
     "# PACT Current State Snapshot",
@@ -1327,6 +1329,7 @@ function buildCurrentStateSnapshot(input: {
     "## Objective",
     snapshotObjective(input.loopDir),
     "",
+    ...behaviorSnapshot,
     "## Acceptance Criteria Status",
     acceptanceCriteriaStatusSnapshot(goalTrackerText, planText, reviewStatusDelta),
     "",
@@ -1364,6 +1367,60 @@ function buildCurrentStateSnapshot(input: {
     workspaceStateSnapshot(input.changedFiles ?? []),
     "",
   ].join("\n")
+}
+
+function behaviorObligationSnapshot(loopDir: string): string[] {
+  const coverage = readCoverageObligationArtifact(loopDir)
+  const checklistPath = join(loopDir, "ultimate-goal-checklist.json")
+  if (!coverage?.obligations.length && !existsSync(checklistPath)) return []
+  const checklistRows = readUltimateGoalChecklistRows(checklistPath)
+  const obligationRows = coverage?.obligations.slice(0, 20) ?? []
+  return [
+    "## Ultimate Goal Non-Negotiables",
+    checklistRows.length
+      ? [
+          "| Check | Status | Obligation |",
+          "| --- | --- | --- |",
+          ...checklistRows.map((row) => `| ${escapeTableCell(row.title)} | ${escapeTableCell(row.status)} | ${escapeTableCell(row.obligationID)} |`),
+        ].join("\n")
+      : "Re-audit the immutable ultimate goal and imported behavioral contract before accepting local reviewer feedback as complete.",
+    "",
+    "## Behavioral Obligations Still Requiring Proof",
+    obligationRows.length
+      ? [
+          "| Obligation | Status | Title |",
+          "| --- | --- | --- |",
+          ...obligationRows.map(
+            (obligation) =>
+              `| ${escapeTableCell(obligation.id)} | ${escapeTableCell(obligation.status ?? "UNVERIFIED")} | ${escapeTableCell(obligation.title)} |`,
+          ),
+        ].join("\n")
+      : "(none recorded)",
+    "",
+  ]
+}
+
+function readUltimateGoalChecklistRows(
+  checklistPath: string,
+): Array<{ title: string; status: string; obligationID: string }> {
+  if (!existsSync(checklistPath)) return []
+  try {
+    const parsed = readJsonFile<Record<string, unknown>>(checklistPath)
+    const checks = Array.isArray(parsed.checks) ? parsed.checks : []
+    return checks
+      .map((item): { title: string; status: string; obligationID: string } | undefined => {
+        if (!item || typeof item !== "object") return undefined
+        const record = item as Record<string, unknown>
+        return {
+          title: typeof record.title === "string" ? record.title : String(record.id ?? "check"),
+          status: typeof record.status === "string" ? record.status : "UNVERIFIED",
+          obligationID: typeof record.obligation_id === "string" ? record.obligation_id : "-",
+        }
+      })
+      .filter((item): item is { title: string; status: string; obligationID: string } => Boolean(item))
+  } catch {
+    return []
+  }
 }
 
 function snapshotObjective(loopDir: string, planPath?: string): string {
@@ -1950,6 +2007,104 @@ export function parseReviewDecision(text: string): ReviewDecision {
   return { marker: "continue", reason: "missing_terminal_signal", parseStatus: "implicit_continue", terminalLine }
 }
 
+function behavioralObligationCompletionGate(
+  loopDir: string,
+  reviewText: string,
+):
+  | {
+      parseStatus: "behavior_obligation_failed"
+      reason: string
+      feedback: string
+    }
+  | undefined {
+  const artifact = readCoverageObligationArtifact(loopDir)
+  if (!artifact?.obligations.length) return undefined
+  const missingSections = [
+    "Behavioral Contract Audit",
+    "Base-Equivalence Proof Audit",
+    "Complete Decision Evidence",
+  ].filter((heading) => !new RegExp(`^###\\s+${escapeRegExp(heading)}\\s*$`, "im").test(reviewText))
+  const unproven = artifact.obligations.filter((obligation) => !reviewProvesBehavioralObligation(reviewText, obligation.id))
+  if (!missingSections.length && !unproven.length) return undefined
+  const feedback = [
+    "Behavioral obligation completion gate failed.",
+    "",
+    "Reviewer PACT_COMPLETE requires an independent audit of the imported behavioral contract, not only worker summary acceptance.",
+    missingSections.length
+      ? `Missing required reviewer sections: ${missingSections.map((section) => `### ${section}`).join(", ")}.`
+      : undefined,
+    unproven.length
+      ? [
+          "Unproven obligations:",
+          ...unproven.map((obligation) => `- ${obligation.id}: ${obligation.title}`),
+        ].join("\n")
+      : undefined,
+    "",
+    "Required terminal evidence: each BO-* must be marked PROVEN_CHANGED, PROVEN_BASE_EQUIVALENT, or NOT_APPLICABLE_WITH_EVIDENCE with concrete patch/source/probe evidence.",
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n")
+  return {
+    parseStatus: "behavior_obligation_failed",
+    reason: "behavior_obligation_failed",
+    feedback,
+  }
+}
+
+type CoverageObligationForGate = {
+  id: string
+  title: string
+  status?: string
+}
+
+function readCoverageObligationArtifact(loopDir: string): { obligations: CoverageObligationForGate[] } | undefined {
+  const artifactPath = join(loopDir, "coverage-obligation.json")
+  if (!existsSync(artifactPath)) return undefined
+  try {
+    const parsed = readJsonFile<Record<string, unknown>>(artifactPath)
+    const obligations = Array.isArray(parsed.obligations) ? parsed.obligations : []
+    return {
+      obligations: obligations
+        .map((item): CoverageObligationForGate | undefined => {
+          if (!item || typeof item !== "object") return undefined
+          const record = item as Record<string, unknown>
+          const id = typeof record.id === "string" ? record.id : undefined
+          if (!id) return undefined
+          return {
+            id,
+            title: typeof record.title === "string" ? record.title : id,
+            status: typeof record.status === "string" ? record.status : undefined,
+          }
+        })
+        .filter((item): item is CoverageObligationForGate => Boolean(item)),
+    }
+  } catch {
+    return undefined
+  }
+}
+
+function reviewProvesBehavioralObligation(reviewText: string, obligationID: string): boolean {
+  const evidenceLines = reviewText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.includes(obligationID))
+  if (!evidenceLines.length) return false
+  for (const line of evidenceLines) {
+    if (/\b(?:UNVERIFIED|MISSING)\b/.test(line)) return false
+    if (/\b(?:PROVEN_CHANGED|NOT_APPLICABLE_WITH_EVIDENCE)\b/.test(line) && line.length >= obligationID.length + 24) {
+      return true
+    }
+    if (
+      /\bPROVEN_BASE_EQUIVALENT\b/.test(line) &&
+      /\b(?:evidence|proof|source|inspected|generated|probe|because|already)\b/i.test(line) &&
+      line.length >= obligationID.length + 36
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
 export function recordReviewDecision(input: {
   loopDir: string
   round: number
@@ -1957,7 +2112,7 @@ export function recordReviewDecision(input: {
   reviewerBackend?: ReviewerBackend
   reviewerModel?: string | null
   forceContinue?: {
-    parseStatus: "patch_apply_failed" | "build_gate_failed"
+    parseStatus: "patch_apply_failed" | "build_gate_failed" | "behavior_obligation_failed"
     reason: string
     feedback: string
     verification?: RoundVerificationArtifact
@@ -1968,7 +2123,10 @@ export function recordReviewDecision(input: {
   const reviewGuidance = extractReviewGuidance(input.reviewText)
   const reviewStatusDelta = extractReviewStatusDelta(input.reviewText)
   const parsedDecision = parseReviewDecision(input.reviewText)
-  const forcedContinue = input.forceContinue && parsedDecision.marker === "complete" ? input.forceContinue : undefined
+  const forcedContinue =
+    parsedDecision.marker === "complete"
+      ? (input.forceContinue ?? behavioralObligationCompletionGate(input.loopDir, input.reviewText))
+      : undefined
   const decision = forcedContinue
     ? {
         marker: "continue" as const,
@@ -2050,7 +2208,9 @@ export function recordReviewDecision(input: {
       blocked_by: forcedContinue
         ? forcedContinue.parseStatus === "build_gate_failed"
           ? "build_gate"
-          : "patch_apply"
+          : forcedContinue.parseStatus === "behavior_obligation_failed"
+            ? "behavior_obligation"
+            : "patch_apply"
         : undefined,
       verification_ref: forcedContinue?.verification
         ? artifactPaths(input.loopDir, input.round).verification
@@ -2294,6 +2454,8 @@ export function buildInitialWorkerPrompt(input: {
     changedFiles: [],
   })
   const specEvidenceLines = specEvidenceReferenceLines(input.loopDir, workerPath)
+  const summaryFile = workerPath(join(input.loopDir, `round-${roundName(input.round)}-summary.md`))
+  const contractFile = workerPath(join(input.loopDir, `round-${roundName(input.round)}-contract.md`))
   return `# PACT Round ${roundName(input.round)} Worker Prompt
 
 ## Objective
@@ -2307,7 +2469,7 @@ ${snapshot}
 
 ## Required Process
 
-First action: write ${workerPath(join(input.loopDir, `round-${roundName(input.round)}-contract.md`))} with:
+First action: write ${contractFile} with:
 - single mainline objective
 - why this objective
 - target ACs
@@ -2333,11 +2495,15 @@ Rules:
 - Do not directly edit todo.md, plan.md, source-plan.md, review artifacts, result artifacts, state artifacts, or replay artifacts.
 - Do not directly edit the immutable section of goal-tracker.md.
 - If goal tracker or todo ledger updates are needed, include a "Goal Tracker / Ledger Update Request" section in your summary.
-- Before stopping, write an honest summary to ${workerPath(join(input.loopDir, `round-${roundName(input.round)}-summary.md`))}.
+- Before stopping, write an honest summary to ${summaryFile}.
 Summary must be concise but specific:
+- What I fixed from reviewer feedback
+- What I re-audited from ultimate goal
 - Changed files and why
 - ACs/tasks advanced
 - Verification commands and actual results
+- Behavior obligations still unproven
+- Base-equivalence proof table
 - Known gaps/blockers
 - Assumptions
 - Goal Tracker / Ledger Update Request, if justified
@@ -2381,6 +2547,8 @@ export function buildContinuationPrompt(input: {
       changedFiles: [],
     })
   const specEvidenceLines = specEvidenceReferenceLines(input.loopDir, workerPath)
+  const summaryFile = workerPath(join(input.loopDir, `round-${roundName(input.round)}-summary.md`))
+  const contractFile = workerPath(join(input.loopDir, `round-${roundName(input.round)}-contract.md`))
   return `# PACT Round ${roundName(input.round)} Worker Prompt
 
 The previous round did not pass review.
@@ -2398,7 +2566,7 @@ ${snapshot.trim()}
 
 ## Required Process
 
-First action: write ${workerPath(join(input.loopDir, `round-${roundName(input.round)}-contract.md`))} with:
+First action: write ${contractFile} with:
 - single mainline objective
 - why this objective
 - target ACs
@@ -2416,11 +2584,15 @@ Round objective selection:
 
 Do not edit source files, run tests, or inspect unrelated files before this contract exists. Missing contract is a reviewer-blocking defect.
 
-Before stopping, write an honest summary to ${workerPath(join(input.loopDir, `round-${roundName(input.round)}-summary.md`))}.
+Before stopping, write an honest summary to ${summaryFile}.
 Summary must be concise but specific:
+- What I fixed from reviewer feedback
+- What I re-audited from ultimate goal
 - Changed files and why
 - ACs/tasks advanced
 - Verification commands and actual results
+- Behavior obligations still unproven
+- Base-equivalence proof table
 - Known gaps/blockers
 - Assumptions
 - Goal Tracker / Ledger Update Request, if justified
@@ -2517,6 +2689,8 @@ Scope:
 - Keep output short and structured.
 - This is the only reviewer pass for this worker round: include code-review checks for correctness, regressions, missing public/self tests, patch separation, and artifact quality.
 - Public verification is authoritative when present for patch apply/build/public-check failures. Do not write PACT_COMPLETE if public verification reports failed/timeout/infra_failed or a failed build_status. The driver runs final hidden scoring only after your candidate PACT_COMPLETE.
+- Do not write PACT_COMPLETE while any hard High target surface is MISSING or unproven by changed code, base-equivalence evidence, or non-applicability evidence.
+- If coverage-obligation.json exists, do not write PACT_COMPLETE unless every BO-* obligation is proven by patch/source/probe evidence. Worker summary and public verification are supporting claims, not proof by themselves.
 
 ## Round Summary
 ${summaryStatus === "present" ? input.summary : "(missing)"}
@@ -2546,6 +2720,15 @@ Audit the worker summary as claims, not facts. Identify unsupported claims, miss
 
 ### Contract Scope Audit
 Audit the round contract as a worker claim. State whether it is too broad, too narrow, avoids required ACs, or correctly focuses the mainline.
+
+### Target Surface Audit
+If a target surface contract exists, audit every hard High target surface. Use only CHANGED, BASE_PROVEN_EQUIVALENT, NOT_APPLICABLE_WITH_EVIDENCE, or MISSING, with evidence. Any MISSING or unproven hard surface blocks PACT_COMPLETE.
+
+### Behavioral Contract Audit
+If behavioral-contract.md or coverage-obligation.json exists, audit every BO-* obligation. Use only PROVEN_CHANGED, PROVEN_BASE_EQUIVALENT, NOT_APPLICABLE_WITH_EVIDENCE, UNVERIFIED, or MISSING, with evidence. Any UNVERIFIED or MISSING obligation blocks PACT_COMPLETE.
+
+### Base-Equivalence Proof Audit
+For every PROVEN_BASE_EQUIVALENT claim, cite concrete repository/source/probe/generated-file evidence. Reject informal no-diff or already-covered claims.
 
 ### Acceptance Criteria Audit
 Audit each AC from the goal tracker as MET, PARTIAL, NOT MET, or DEFERRED with evidence.
@@ -2581,6 +2764,9 @@ Example: \`\`\`json
 
 ### Suggested Priorities
 List non-binding advisory priorities for future work. These are evidence for the next worker, not an assignment and not a replacement for the Ultimate Goal. Do not narrow the next worker round to a single checkpoint unless the facts show broader progress would be unsafe or unverifiable.
+
+### Complete Decision Evidence
+If and only if you are about to write PACT_COMPLETE, summarize why every AC, hard target surface, and BO-* obligation is complete or explicitly proven non-applicable/base-equivalent.
 
 Only if all acceptance criteria and the current phase requirements are fully satisfied, write PACT_COMPLETE as the final non-empty line.
 For any other outcome, do not write a terminal marker. PACT_STOP and PACT_CONTINUE are deprecated and will be treated as continuation feedback.
@@ -3176,10 +3362,32 @@ function specEvidenceReferenceLines(loopDir: string, renderPath: (path: string) 
   const manifestPath = join(loopDir, "spec-input-manifest.json")
   const evidenceDir = join(loopDir, "spec-source", "enhanced_requirement_sections")
   const localizationPath = join(loopDir, "spec-code-localization.md")
+  const targetSurfaceContractPath = join(loopDir, "target-surface-contract.md")
+  const targetSurfacesPath = join(loopDir, "target-surfaces.json")
+  const behavioralContractPath = join(loopDir, "behavioral-contract.md")
+  const coverageObligationPath = join(loopDir, "coverage-obligation.json")
+  const ultimateGoalChecklistPath = join(loopDir, "ultimate-goal-checklist.json")
+  const reviewerAuditChecklistPath = join(loopDir, "reviewer-audit-checklist.md")
   const lines: string[] = []
   if (existsSync(manifestPath)) lines.push(`- Spec input manifest: ${renderPath(manifestPath)}`)
   if (existsSync(evidenceDir)) lines.push(`- Spec evidence directory: ${renderPath(evidenceDir)}`)
   if (existsSync(localizationPath)) lines.push(`- Spec code localization: ${renderPath(localizationPath)}`)
+  if (existsSync(targetSurfaceContractPath)) {
+    lines.push(`- Target surface contract: ${renderPath(targetSurfaceContractPath)}`)
+    lines.push(
+      "- Hard Target Surface Completion Gate: every hard High target surface needs status CHANGED, BASE_PROVEN_EQUIVALENT, NOT_APPLICABLE_WITH_EVIDENCE, or MISSING; informal no-diff claims are insufficient.",
+    )
+  }
+  if (existsSync(targetSurfacesPath)) lines.push(`- Target surfaces JSON: ${renderPath(targetSurfacesPath)}`)
+  if (existsSync(behavioralContractPath)) lines.push(`- Behavioral contract: ${renderPath(behavioralContractPath)}`)
+  if (existsSync(coverageObligationPath)) {
+    lines.push(`- Coverage obligations: ${renderPath(coverageObligationPath)}`)
+    lines.push(
+      "- Behavioral Obligation Completion Gate: every BO-* must be PROVEN_CHANGED, PROVEN_BASE_EQUIVALENT, or NOT_APPLICABLE_WITH_EVIDENCE before reviewer completion.",
+    )
+  }
+  if (existsSync(ultimateGoalChecklistPath)) lines.push(`- Ultimate goal checklist: ${renderPath(ultimateGoalChecklistPath)}`)
+  if (existsSync(reviewerAuditChecklistPath)) lines.push(`- Reviewer audit checklist: ${renderPath(reviewerAuditChecklistPath)}`)
   if (lines.length) {
     lines.push("- Spec evidence is advisory; verify code-localization claims against repository source before editing.")
   }
@@ -3572,14 +3780,29 @@ function redactValue(value: unknown): unknown {
 }
 
 export function redactText(text: string): string {
-  const secretKey = String.raw`(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|authorization|token|secret|password)`
-  return text
+  const secretKey = String.raw`(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|token|secret|password)`
+  return redactKnownSecretValues(text)
     .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1[REDACTED]")
     .replace(
       new RegExp(`(["']?)\\b(${secretKey})\\b\\1\\s*([:=])\\s*(["'])(?:(?!\\4).)*\\4`, "gi"),
       "$1$2$1$3$4[REDACTED]$4",
     )
     .replace(new RegExp(`(["']?)\\b(${secretKey})\\b\\1\\s*[:=]\\s*[^,\\s;}]+`, "gi"), "$1$2$1=[REDACTED]")
+}
+
+function redactKnownSecretValues(text: string): string {
+  let redacted = text
+  for (const value of currentSecretEnvValues()) {
+    redacted = redacted.split(value).join("[REDACTED]")
+  }
+  return redacted
+}
+
+function currentSecretEnvValues(): string[] {
+  return Object.entries(process.env)
+    .filter(([key, value]) => Boolean(value) && value!.length >= 8 && /api[_-]?key|authorization|token|secret|password/i.test(key))
+    .map(([, value]) => value!)
+    .sort((left, right) => right.length - left.length)
 }
 
 export function commitRoundHistory(loopDir: string, round: number, message: string): void {
@@ -3596,6 +3819,13 @@ export function commitRoundHistory(loopDir: string, round: number, message: stri
         fileName === "plan.md" ||
         fileName === "todo.md" ||
         fileName === "goal-tracker.md" ||
+        fileName === "target-surface-contract.md" ||
+        fileName === "target-surfaces.json" ||
+        fileName === "behavioral-contract.md" ||
+        fileName === "coverage-obligation.json" ||
+        fileName === "ultimate-goal-checklist.json" ||
+        fileName === "reviewer-audit-checklist.md" ||
+        fileName === "spec-input-manifest.json" ||
         fileName.startsWith(`round-${roundName(round)}`)
       ) {
         copyFileSync(filePath, join(artifactDir, fileName))
