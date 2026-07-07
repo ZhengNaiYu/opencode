@@ -153,6 +153,42 @@ describe("PACT spec importer", () => {
     expect(todo).toContain("STEP-002")
     expect(todo).not.toContain("STEP-001")
     expect(todo).not.toContain("Put implementation changes in solution.patch")
+
+    expect(existsSync(join(outputLoopDir, "target-surfaces.json"))).toBe(true)
+    expect(existsSync(join(outputLoopDir, "target-surface-contract.md"))).toBe(true)
+    for (const fileName of [
+      "behavioral-contract.md",
+      "coverage-obligation.json",
+      "ultimate-goal-checklist.json",
+      "reviewer-audit-checklist.md",
+    ]) {
+      expect(existsSync(join(outputLoopDir, fileName))).toBe(true)
+    }
+    const contract = readFileSync(join(outputLoopDir, "target-surface-contract.md"), "utf-8")
+    expect(contract).toContain("Hard Target Surface Status Gate")
+    expect(contract).toContain("CHANGED")
+    expect(contract).toContain("BASE_PROVEN_EQUIVALENT")
+    expect(contract).not.toContain("JUSTIFIED_NO_DIFF")
+    const behavioralContract = readFileSync(join(outputLoopDir, "behavioral-contract.md"), "utf-8")
+    expect(behavioralContract).toContain("Runtime behavior")
+    expect(behavioralContract).toContain("Compatibility")
+    expect(behavioralContract).toContain("Lib/feature.py")
+    const coverageObligation = JSON.parse(readFileSync(join(outputLoopDir, "coverage-obligation.json"), "utf-8"))
+    expect(coverageObligation.obligations).toContainEqual(
+      expect.objectContaining({
+        id: "BO-001",
+        title: "Runtime behavior",
+        status: "UNVERIFIED",
+      }),
+    )
+    expect(coverageObligation.obligations).not.toContainEqual(
+      expect.objectContaining({ title: "Patch Artifact Scope" }),
+    )
+    const checklist = JSON.parse(readFileSync(join(outputLoopDir, "ultimate-goal-checklist.json"), "utf-8"))
+    expect(checklist.checks).toContainEqual(expect.objectContaining({ id: "UG-001", status: "UNVERIFIED" }))
+    expect(readFileSync(join(outputLoopDir, "reviewer-audit-checklist.md"), "utf-8")).toContain(
+      "Base-Equivalence Proof Audit",
+    )
   })
 
   test("falls back to implementation steps when decomposed requirements are delivery-only", () => {

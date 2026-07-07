@@ -39,6 +39,34 @@ type TodoSeed = {
   hard_requirement: boolean
 }
 
+type TargetSurfacePriority = "High" | "Medium" | "Low"
+
+type TargetSurfaceCategory = "implementation" | "integration" | "generated" | "test" | "documentation" | "reference"
+
+type TargetSurface = {
+  id: string
+  path: string
+  priority: TargetSurfacePriority
+  category: TargetSurfaceCategory
+  requirement: "hard_cover_or_prove" | "inspect_if_relevant"
+  hard_status_gate: boolean
+  allowed_statuses?: string[]
+  source_files: string[]
+  reason: string
+  evidence_count: number
+}
+
+type BehavioralObligation = {
+  id: string
+  title: string
+  requirement: string
+  reqs: string[]
+  source_refs: string[]
+  target_surfaces: string[]
+  checks: string[]
+  status: "UNVERIFIED"
+}
+
 export type SpecImportInput = {
   bundleDir: string
   outputLoopDir: string
@@ -72,6 +100,8 @@ type BundleData = {
   groups: RequirementGroup[]
   todoSeed: TodoSeed[]
   codeLocalization?: SectionFile
+  targetSurfaces: TargetSurface[]
+  behavioralObligations: BehavioralObligation[]
 }
 
 const excludedFiles = [
@@ -83,6 +113,14 @@ const excludedFiles = [
 ]
 
 const copiedSectionsRelativeDir = "spec-source/enhanced_requirement_sections"
+const hardTargetSurfaceStatuses = ["CHANGED", "BASE_PROVEN_EQUIVALENT", "NOT_APPLICABLE_WITH_EVIDENCE", "MISSING"]
+const coverageObligationStatuses = [
+  "UNVERIFIED",
+  "PROVEN_CHANGED",
+  "PROVEN_BASE_EQUIVALENT",
+  "NOT_APPLICABLE_WITH_EVIDENCE",
+  "MISSING",
+]
 
 export function importSpecBundle(input: SpecImportInput): SpecImportResult {
   const bundleDir = resolve(input.bundleDir)
@@ -95,10 +133,16 @@ export function importSpecBundle(input: SpecImportInput): SpecImportResult {
   mkdirSync(outputLoopDir, { recursive: true })
   copySectionEvidence(data.sectionsDir, join(outputLoopDir, copiedSectionsRelativeDir))
 
+  const targetSurfaceContract = renderTargetSurfaceContract(data.targetSurfaces)
+  const targetSurfaceInventory = targetSurfaceInventoryJson(data)
+  const behavioralContract = renderBehavioralContract(data)
+  const coverageObligation = coverageObligationJson(data)
+  const ultimateGoalChecklist = ultimateGoalChecklistJson(data)
+  const reviewerAuditChecklist = renderReviewerAuditChecklist(data)
   const sourcePlan = renderSourcePlan(data)
   const plan = renderPlan(data)
   const todo = renderTodo(data)
-  const goalTracker = renderGoalTracker(data)
+  const goalTracker = renderGoalTracker(data, targetSurfaceContract)
   const goalTrackerHash = goalTrackerImmutableSha256(goalTracker)
   const baseCommit = currentHeadCommit(projectRoot)
   const state = {
@@ -139,6 +183,12 @@ export function importSpecBundle(input: SpecImportInput): SpecImportResult {
       artifact_generation_strategy: "markdown-sections-v2",
       copied_evidence_dir: join(outputLoopDir, copiedSectionsRelativeDir),
       code_localization_file: data.codeLocalization ? join(outputLoopDir, "spec-code-localization.md") : undefined,
+      target_surfaces_file: join(outputLoopDir, "target-surfaces.json"),
+      target_surface_contract_file: join(outputLoopDir, "target-surface-contract.md"),
+      behavioral_contract_file: join(outputLoopDir, "behavioral-contract.md"),
+      coverage_obligation_file: join(outputLoopDir, "coverage-obligation.json"),
+      ultimate_goal_checklist_file: join(outputLoopDir, "ultimate-goal-checklist.json"),
+      reviewer_audit_checklist_file: join(outputLoopDir, "reviewer-audit-checklist.md"),
       excluded_files: excludedFiles,
     },
   }
@@ -147,6 +197,9 @@ export function importSpecBundle(input: SpecImportInput): SpecImportResult {
   writeFileSync(join(outputLoopDir, "plan.md"), plan, "utf-8")
   writeFileSync(join(outputLoopDir, "todo.md"), todo, "utf-8")
   writeFileSync(join(outputLoopDir, "goal-tracker.md"), goalTracker, "utf-8")
+  writeFileSync(join(outputLoopDir, "target-surface-contract.md"), targetSurfaceContract, "utf-8")
+  writeFileSync(join(outputLoopDir, "behavioral-contract.md"), behavioralContract, "utf-8")
+  writeFileSync(join(outputLoopDir, "reviewer-audit-checklist.md"), reviewerAuditChecklist, "utf-8")
   writeFileSync(join(outputLoopDir, "spec-implementation-anchors.md"), sectionText(data, "implementation_anchors"), "utf-8")
   writeFileSync(join(outputLoopDir, "spec-decomposed-steps.md"), sectionText(data, "decomposed_implementation_steps"), "utf-8")
   writeFileSync(join(outputLoopDir, "spec-decomposed-requirements.md"), sectionText(data, "decomposed_requirements"), "utf-8")
@@ -157,6 +210,9 @@ export function importSpecBundle(input: SpecImportInput): SpecImportResult {
     writeFileSync(join(outputLoopDir, "spec-code-localization.md"), data.codeLocalization.content, "utf-8")
   }
   writeJsonFile(join(outputLoopDir, "state.json"), state)
+  writeJsonFile(join(outputLoopDir, "target-surfaces.json"), targetSurfaceInventory)
+  writeJsonFile(join(outputLoopDir, "coverage-obligation.json"), coverageObligation)
+  writeJsonFile(join(outputLoopDir, "ultimate-goal-checklist.json"), ultimateGoalChecklist)
   writeJsonFile(join(outputLoopDir, "spec-input-manifest.json"), specInputManifest(data, outputLoopDir))
 
   writeJsonFile(artifactPaths(outputLoopDir, 1).loopManifest, {
@@ -174,6 +230,12 @@ export function importSpecBundle(input: SpecImportInput): SpecImportResult {
     artifact_generation_strategy: "markdown-sections-v2",
     copied_evidence_dir: join(outputLoopDir, copiedSectionsRelativeDir),
     code_localization_file: data.codeLocalization ? join(outputLoopDir, "spec-code-localization.md") : undefined,
+    target_surfaces_file: join(outputLoopDir, "target-surfaces.json"),
+    target_surface_contract_file: join(outputLoopDir, "target-surface-contract.md"),
+    behavioral_contract_file: join(outputLoopDir, "behavioral-contract.md"),
+    coverage_obligation_file: join(outputLoopDir, "coverage-obligation.json"),
+    ultimate_goal_checklist_file: join(outputLoopDir, "ultimate-goal-checklist.json"),
+    reviewer_audit_checklist_file: join(outputLoopDir, "reviewer-audit-checklist.md"),
     excluded_files: excludedFiles,
     max_rounds: state.max_rounds,
     next_round: state.next_round,
@@ -243,6 +305,9 @@ export function importSpecBundle(input: SpecImportInput): SpecImportResult {
       imported_groups: data.groups.length,
       imported_tasks: data.todoSeed.length,
       imported_sections: data.sections.length,
+      target_surfaces: data.targetSurfaces.length,
+      hard_target_surfaces: data.targetSurfaces.filter((surface) => surface.hard_status_gate).length,
+      behavioral_obligations: data.behavioralObligations.length,
     },
     artifacts: {
       source_plan: join(outputLoopDir, "source-plan.md"),
@@ -252,6 +317,12 @@ export function importSpecBundle(input: SpecImportInput): SpecImportResult {
       spec_input_manifest: join(outputLoopDir, "spec-input-manifest.json"),
       spec_evidence_dir: join(outputLoopDir, copiedSectionsRelativeDir),
       spec_code_localization: data.codeLocalization ? join(outputLoopDir, "spec-code-localization.md") : undefined,
+      target_surfaces: join(outputLoopDir, "target-surfaces.json"),
+      target_surface_contract: join(outputLoopDir, "target-surface-contract.md"),
+      behavioral_contract: join(outputLoopDir, "behavioral-contract.md"),
+      coverage_obligation: join(outputLoopDir, "coverage-obligation.json"),
+      ultimate_goal_checklist: join(outputLoopDir, "ultimate-goal-checklist.json"),
+      reviewer_audit_checklist: join(outputLoopDir, "reviewer-audit-checklist.md"),
       git_snapshot: join(outputLoopDir, "round-00-git-snapshot.json"),
     },
   })
@@ -275,6 +346,12 @@ export function importSpecBundle(input: SpecImportInput): SpecImportResult {
       "spec-input-manifest.json",
       "spec-source/enhanced_requirement_sections",
       "spec-code-localization.md",
+      "target-surfaces.json",
+      "target-surface-contract.md",
+      "behavioral-contract.md",
+      "coverage-obligation.json",
+      "ultimate-goal-checklist.json",
+      "reviewer-audit-checklist.md",
     ],
   }
 }
@@ -290,19 +367,28 @@ function readBundle(input: { bundleDir: string; outputLoopDir: string }): Bundle
     (group) => !isDeliveryOnlyGroup(group),
   )
   const groups = parsedGroups.length ? parsedGroups : groupsFromSteps(nonDeliverySteps)
-  return {
+  const originalRequirement =
+    stripHeading(sectionTextFromSections(sections, "original_requirement")) ||
+    readOptionalText(join(input.bundleDir, "original_requirement.txt")) ||
+    stripHeading(sectionTextFromSections(sections, "problem_understanding")) ||
+    "Imported LoLBench requirement."
+  const baseData = {
     bundleDir: input.bundleDir,
     sectionsDir,
     copiedSectionsDir: join(input.outputLoopDir, copiedSectionsRelativeDir),
     sections,
-    originalRequirement:
-      stripHeading(sectionTextFromSections(sections, "original_requirement")) ||
-      readOptionalText(join(input.bundleDir, "original_requirement.txt")) ||
-      stripHeading(sectionTextFromSections(sections, "problem_understanding")) ||
-      "Imported LoLBench requirement.",
+    originalRequirement,
     groups,
     todoSeed: nonDeliverySteps,
     codeLocalization,
+    targetSurfaces: [],
+    behavioralObligations: [],
+  } satisfies BundleData
+  const targetSurfaces = inferTargetSurfaces(baseData)
+  const data = { ...baseData, targetSurfaces }
+  return {
+    ...data,
+    behavioralObligations: inferBehavioralObligations(data),
   }
 }
 
@@ -418,6 +504,12 @@ function renderSourcePlan(data: BundleData): string {
     "## Spec Evidence",
     `- Copied section directory: ${copiedSectionsRelativeDir}`,
     data.codeLocalization ? "- Code localization supplement: spec-code-localization.md" : "- Code localization supplement: unavailable",
+    "- Target surface contract: target-surface-contract.md",
+    "- Target surfaces JSON: target-surfaces.json",
+    "- Behavioral contract: behavioral-contract.md",
+    "- Coverage obligations: coverage-obligation.json",
+    "- Ultimate goal checklist: ultimate-goal-checklist.json",
+    "- Reviewer audit checklist: reviewer-audit-checklist.md",
     "",
   ].join("\n")
 }
@@ -445,6 +537,12 @@ function renderPlan(data: BundleData): string {
     `- Spec input manifest: spec-input-manifest.json`,
     `- Copied source sections: ${copiedSectionsRelativeDir}`,
     data.codeLocalization ? "- Code/function localization supplement: spec-code-localization.md" : "- Code/function localization supplement: unavailable",
+    "- Target surface contract: target-surface-contract.md",
+    "- Target surfaces JSON: target-surfaces.json",
+    "- Behavioral contract: behavioral-contract.md",
+    "- Coverage obligations: coverage-obligation.json",
+    "- Ultimate goal checklist: ultimate-goal-checklist.json",
+    "- Reviewer audit checklist: reviewer-audit-checklist.md",
     "- These evidence files are advisory inspection aids. Use them when helpful, then verify against the repository source before editing.",
     "",
     "## Dependencies",
@@ -482,7 +580,7 @@ function renderTodo(data: BundleData): string {
   ].join("\n")
 }
 
-function renderGoalTracker(data: BundleData): string {
+function renderGoalTracker(data: BundleData, targetSurfaceContract: string): string {
   return [
     "# Goal Tracker",
     "",
@@ -511,6 +609,19 @@ function renderGoalTracker(data: BundleData): string {
     `- Spec input manifest: spec-input-manifest.json`,
     `- Copied source sections: ${copiedSectionsRelativeDir}`,
     data.codeLocalization ? "- Code/function localization supplement: spec-code-localization.md" : "- Code/function localization supplement: unavailable",
+    "- Target surface contract: target-surface-contract.md",
+    "- Target surfaces JSON: target-surfaces.json",
+    "- Behavioral contract: behavioral-contract.md",
+    "- Coverage obligations: coverage-obligation.json",
+    "- Ultimate goal checklist: ultimate-goal-checklist.json",
+    "- Reviewer audit checklist: reviewer-audit-checklist.md",
+    "",
+    "### Target Surface Contract",
+    targetSurfaceContract
+      .split(/\r?\n/)
+      .filter((line) => !line.startsWith("# "))
+      .join("\n")
+      .trim(),
     "",
     "### Imported Formal Verification Checklist",
     sectionText(data, "formal_verification_checklist").trim(),
@@ -553,6 +664,407 @@ function renderGoalTracker(data: BundleData): string {
   ].join("\n")
 }
 
+function targetSurfaceInventoryJson(data: BundleData): Record<string, unknown> {
+  return {
+    schema: "pact-target-surfaces/v2",
+    artifact_generation_strategy: "markdown-sections-v2",
+    bundle_dir: data.bundleDir,
+    hard_status_gate: {
+      applies_to: "surfaces where hard_status_gate=true",
+      allowed_statuses: hardTargetSurfaceStatuses,
+      completion_rule:
+        "Every hard surface must be CHANGED, BASE_PROVEN_EQUIVALENT, or NOT_APPLICABLE_WITH_EVIDENCE before reviewer completion.",
+    },
+    surfaces: data.targetSurfaces,
+  }
+}
+
+function renderTargetSurfaceContract(surfaces: TargetSurface[]): string {
+  const hardSurfaces = surfaces.filter((surface) => surface.hard_status_gate)
+  const optionalCount = surfaces.length - hardSurfaces.length
+  return [
+    "# Target Surface Contract",
+    "",
+    "This deterministic contract is derived from the imported source spec. It is not a gold patch and does not identify hidden tests.",
+    "",
+    "## Hard Target Surface Status Gate",
+    `Allowed status values: ${hardTargetSurfaceStatuses.join(", ")}.`,
+    "For every hard High surface, the worker summary and reviewer audit must record one allowed status. MISSING or unproven hard surfaces keep the loop open.",
+    "Base-equivalence claims require concrete repository evidence: current source inspection, targeted probes, or generated-file workflow evidence. Informal no-diff claims are not sufficient.",
+    "",
+    "## Hard High Target Surfaces",
+    "| ID | Path | Priority | Category | Requirement | Allowed Statuses | Source Evidence | Reason |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    ...(hardSurfaces.length
+      ? hardSurfaces.map(
+          (surface) =>
+            `| ${surface.id} | ${escapeTableCell(surface.path)} | ${surface.priority} | ${surface.category} | ${surface.requirement} | ${hardTargetSurfaceStatuses.join(", ")} | ${escapeTableCell(surface.source_files.join(", "))} | ${escapeTableCell(surface.reason)} |`,
+        )
+      : ["| - | - | - | - | - | - | - | No hard target surfaces were inferred from the imported spec. |"]),
+    "",
+    "## Optional Inspection Surfaces",
+    optionalCount
+      ? `Full Medium/Low and non-gated surfaces are available in target-surfaces.json (${optionalCount} optional entries).`
+      : "No optional inspection surfaces were inferred.",
+    "",
+    "## Worker Summary Requirement",
+    "Include a Target Surface Status table when this file exists, covering every hard surface with path, status, evidence, and remaining work.",
+    "",
+    "## Reviewer Audit Requirement",
+    "Audit the worker table against patch metadata, repository state, and source-spec evidence. Do not accept completion while any hard surface is MISSING or lacks evidence for base equivalence or non-applicability.",
+    "",
+  ].join("\n")
+}
+
+function renderBehavioralContract(data: BundleData): string {
+  return [
+    "# Behavioral Contract",
+    "",
+    "This deterministic contract is derived from imported source-spec sections. It is not a gold patch and does not expose hidden tests.",
+    "",
+    "## Ultimate Goal",
+    data.originalRequirement.trim(),
+    "",
+    "## Behavioral Obligations",
+    "| ID | Title | Requirement | Source Refs | Target Surfaces | Checks |",
+    "| --- | --- | --- | --- | --- | --- |",
+    ...data.behavioralObligations.map(
+      (obligation) =>
+        `| ${obligation.id} | ${escapeTableCell(obligation.title)} | ${escapeTableCell(obligation.requirement)} | ${escapeTableCell(obligation.source_refs.join(", "))} | ${escapeTableCell(obligation.target_surfaces.join(", ") || "-")} | ${escapeTableCell(obligation.checks.join("; ") || "-")} |`,
+    ),
+    "",
+    "## Source Evidence Available On Demand",
+    `- Copied source sections: ${copiedSectionsRelativeDir}`,
+    data.codeLocalization ? "- Code/function localization supplement: spec-code-localization.md" : "- Code/function localization supplement: unavailable",
+    "- Target surface contract: target-surface-contract.md",
+    "- Target surfaces JSON: target-surfaces.json",
+    "- Coverage obligations JSON: coverage-obligation.json",
+    "- Ultimate goal checklist JSON: ultimate-goal-checklist.json",
+    "",
+    "## Completion Rule",
+    "Reviewer completion must prove every behavioral obligation as PROVEN_CHANGED, PROVEN_BASE_EQUIVALENT, or NOT_APPLICABLE_WITH_EVIDENCE. UNVERIFIED or MISSING obligations keep the loop open.",
+    "BASE_PROVEN_EQUIVALENT requires concrete repository evidence, not a worker summary assertion.",
+    "",
+  ].join("\n")
+}
+
+function coverageObligationJson(data: BundleData): Record<string, unknown> {
+  return {
+    schema: "pact-coverage-obligation/v1",
+    artifact_generation_strategy: "markdown-sections-v2",
+    statuses: coverageObligationStatuses,
+    completion_rule:
+      "Every obligation must be proven as PROVEN_CHANGED, PROVEN_BASE_EQUIVALENT, or NOT_APPLICABLE_WITH_EVIDENCE before reviewer PACT_COMPLETE is accepted.",
+    obligations: data.behavioralObligations,
+  }
+}
+
+function ultimateGoalChecklistJson(data: BundleData): Record<string, unknown> {
+  return {
+    schema: "pact-ultimate-goal-checklist/v1",
+    artifact_generation_strategy: "markdown-sections-v2",
+    ultimate_goal: data.originalRequirement.trim(),
+    checks: data.behavioralObligations.map((obligation, index) => ({
+      id: `UG-${String(index + 1).padStart(3, "0")}`,
+      title: obligation.title,
+      obligation_id: obligation.id,
+      requirement: obligation.requirement,
+      source_refs: obligation.source_refs,
+      target_surfaces: obligation.target_surfaces,
+      status: "UNVERIFIED",
+    })),
+  }
+}
+
+function renderReviewerAuditChecklist(data: BundleData): string {
+  return [
+    "# Reviewer Audit Checklist",
+    "",
+    "Use this checklist in every review before accepting PACT_COMPLETE.",
+    "",
+    "## Behavioral Contract Audit",
+    "- Re-read behavioral-contract.md and coverage-obligation.json.",
+    "- Audit each BO-* obligation against the patch, changed files, repository source, and public verification facts.",
+    "- Do not treat worker summary text as proof by itself.",
+    "",
+    "## Base-Equivalence Proof Audit",
+    "- For PROVEN_BASE_EQUIVALENT, cite concrete source inspection, generated-file workflow evidence, or targeted probes.",
+    "- Reject informal no-diff, not-needed, already-ok, or public-tests-pass claims without evidence.",
+    "",
+    "## Complete Decision Evidence",
+    "- PACT_COMPLETE is allowed only when every BO-* is PROVEN_CHANGED, PROVEN_BASE_EQUIVALENT, or NOT_APPLICABLE_WITH_EVIDENCE.",
+    "- Any UNVERIFIED or MISSING obligation must produce continuation guidance.",
+    "",
+    "## Obligation IDs",
+    ...data.behavioralObligations.map(
+      (obligation) =>
+        `- ${obligation.id}: ${obligation.title} (${obligation.target_surfaces.join(", ") || "no specific target surface"})`,
+    ),
+    "",
+  ].join("\n")
+}
+
+function inferBehavioralObligations(data: BundleData): BehavioralObligation[] {
+  const sourceRefs = sourceReferenceFileNames(data)
+  const obligations = data.groups.map((group, index) => {
+    const matchingTasks = tasksForGroup(data, group)
+    const anchors = uniqueStrings(matchingTasks.flatMap((task) => task.anchors).filter((anchor) => anchor !== "none"))
+    const surfaces = uniqueStrings([
+      ...anchors,
+      ...data.targetSurfaces
+        .filter((surface) => anchors.some((anchor) => surface.path === normalizeSurfacePath(anchor) || surface.path.startsWith(`${normalizeSurfacePath(anchor)}/`)))
+        .map((surface) => surface.path),
+    ]).filter(isUsefulSurfacePath)
+    const checks = uniqueStrings([
+      ...matchingTasks.flatMap((task) => task.checks),
+      groupPositiveTests(group, data),
+      groupNegativeTests(group, data),
+    ]).filter(Boolean)
+    return {
+      id: `BO-${String(index + 1).padStart(3, "0")}`,
+      title: group.title,
+      requirement: groupCriterion(group),
+      reqs: group.reqs,
+      source_refs: sourceRefs,
+      target_surfaces: surfaces,
+      checks,
+      status: "UNVERIFIED",
+    } satisfies BehavioralObligation
+  })
+  if (obligations.length) return obligations
+  return data.todoSeed.map((task, index) => ({
+    id: `BO-${String(index + 1).padStart(3, "0")}`,
+    title: task.title,
+    requirement: taskDescription(task),
+    reqs: task.reqs,
+    source_refs: sourceRefs,
+    target_surfaces: task.anchors.filter(isUsefulSurfacePath),
+    checks: task.checks,
+    status: "UNVERIFIED",
+  }))
+}
+
+function tasksForGroup(data: BundleData, group: RequirementGroup): TodoSeed[] {
+  return data.todoSeed.filter((task) => {
+    if (group.sourceStepID && task.step_id === group.sourceStepID) return true
+    return task.reqs.some((req) => group.reqs.includes(req))
+  })
+}
+
+function sourceReferenceFileNames(data: BundleData): string[] {
+  return data.sections
+    .filter((section) =>
+      /decomposed_requirements|decomposed_implementation_steps|formal_verification_checklist|edge_cases|anti_patterns|repo_inferred_obligations|implementation_anchors/.test(
+        section.slug,
+      ),
+    )
+    .map((section) => section.fileName)
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))]
+}
+
+type TargetSurfaceDraft = {
+  path: string
+  priority: TargetSurfacePriority
+  category: TargetSurfaceCategory
+  hard: boolean
+  sourceFiles: Set<string>
+  reasons: Set<string>
+  evidenceCount: number
+}
+
+function inferTargetSurfaces(data: BundleData): TargetSurface[] {
+  const drafts = new Map<string, TargetSurfaceDraft>()
+  for (const section of data.sections) {
+    for (const line of section.content.split(/\r?\n/)) {
+      const paths = extractRepoPaths(line)
+      if (!paths.length) continue
+      const priority = priorityForSurfaceLine(section, line)
+      const reason = reasonForSurfaceLine(section, line)
+      for (const path of paths) {
+        addTargetSurfaceDraft(drafts, path, {
+          priority,
+          category: categoryForSurfacePath(path),
+          hard: priority === "High" && hardEligibleSurfacePath(path),
+          sourceFile: section.fileName,
+          reason,
+        })
+      }
+    }
+  }
+
+  return [...drafts.values()]
+    .map((draft) => {
+      const hard = draft.hard && draft.priority === "High" && hardEligibleSurfacePath(draft.path)
+      return {
+        id: "",
+        path: draft.path,
+        priority: draft.priority,
+        category: draft.category,
+        requirement: hard ? "hard_cover_or_prove" : "inspect_if_relevant",
+        hard_status_gate: hard,
+        allowed_statuses: hard ? hardTargetSurfaceStatuses : undefined,
+        source_files: [...draft.sourceFiles].sort(),
+        reason: [...draft.reasons].sort().join("; "),
+        evidence_count: draft.evidenceCount,
+      } satisfies TargetSurface
+    })
+    .sort((left, right) => priorityRank(left.priority) - priorityRank(right.priority) || left.path.localeCompare(right.path))
+    .map((surface, index) => ({ ...surface, id: `TS-${String(index + 1).padStart(3, "0")}` }))
+}
+
+function addTargetSurfaceDraft(
+  drafts: Map<string, TargetSurfaceDraft>,
+  rawPath: string,
+  input: {
+    priority: TargetSurfacePriority
+    category: TargetSurfaceCategory
+    hard: boolean
+    sourceFile: string
+    reason: string
+  },
+): void {
+  const path = normalizeSurfacePath(rawPath)
+  if (!path || !isUsefulSurfacePath(path)) return
+  const existing =
+    drafts.get(path) ??
+    ({
+      path,
+      priority: "Low",
+      category: categoryForSurfacePath(path),
+      hard: false,
+      sourceFiles: new Set<string>(),
+      reasons: new Set<string>(),
+      evidenceCount: 0,
+    } satisfies TargetSurfaceDraft)
+  existing.priority = strongerPriority(existing.priority, input.priority)
+  existing.category = strongerCategory(existing.category, input.category)
+  existing.hard = existing.hard || input.hard
+  existing.sourceFiles.add(input.sourceFile)
+  existing.reasons.add(input.reason)
+  existing.evidenceCount += 1
+  drafts.set(path, existing)
+}
+
+function extractRepoPaths(line: string): string[] {
+  const paths = new Set<string>()
+  for (const match of line.matchAll(/`([^`]+)`/g)) {
+    for (const candidate of splitPathCandidates(match[1] ?? "")) {
+      if (looksLikeRepoPath(candidate)) paths.add(normalizeSurfacePath(candidate))
+    }
+  }
+  for (const match of line.matchAll(/\b(?:Lib|Modules|Python|Parser|Grammar|Objects|Include|Tools|Doc|PCbuild|PC|Misc|Programs)\/[A-Za-z0-9_./+-]+/g)) {
+    paths.add(normalizeSurfacePath(match[0] ?? ""))
+  }
+  for (const match of line.matchAll(/\b(?:Makefile\.pre\.in|configure\.ac|configure|setup\.py)\b/g)) {
+    paths.add(normalizeSurfacePath(match[0] ?? ""))
+  }
+  return [...paths].filter(isUsefulSurfacePath)
+}
+
+function splitPathCandidates(text: string): string[] {
+  return text
+    .split(/[\s,;]+/)
+    .map((candidate) => candidate.trim())
+    .filter(Boolean)
+}
+
+function looksLikeRepoPath(candidate: string): boolean {
+  const path = normalizeSurfacePath(candidate)
+  if (/^(?:Lib|Modules|Python|Parser|Grammar|Objects|Include|Tools|Doc|PCbuild|PC|Misc|Programs)\//.test(path)) {
+    return true
+  }
+  return /^(?:Makefile\.pre\.in|configure\.ac|configure|setup\.py)$/.test(path)
+}
+
+function normalizeSurfacePath(rawPath: string): string {
+  return rawPath
+    .trim()
+    .replace(/^['"]|['"]$/g, "")
+    .replace(/^[.][/]/, "")
+    .replace(/[).,:;]+$/g, "")
+}
+
+function isUsefulSurfacePath(path: string): boolean {
+  if (!path) return false
+  if (/^(?:solution|test|patch_final)\.patch$/.test(path)) return false
+  if (/\/$/.test(path)) return false
+  if (path.includes("://")) return false
+  if (path.startsWith("/")) return false
+  if (/\.\./.test(path)) return false
+  return looksLikeRepoPath(path)
+}
+
+function priorityForSurfaceLine(section: SectionFile, line: string): TargetSurfacePriority {
+  const lower = line.toLowerCase()
+  const slug = section.slug
+  const hasStrongConfidence = /confidence\s*[:=]\s*(?:1\.0|0\.9|high)/i.test(line)
+  const hasRequiredAction =
+    /\b(?:required|likely edit|required edit|required generated update|must implement|likely implementation|likely edit)\b/i.test(
+      line,
+    )
+  const hasHardSignal = /hard_requirement=true/i.test(line) || (hasStrongConfidence && hasRequiredAction)
+  let priority: TargetSurfacePriority = "Low"
+  if (/explicit_target_files/.test(slug) && !/\bnone\b/i.test(line)) priority = "High"
+  if (/implementation_anchors/.test(slug)) priority = "Medium"
+  if (/decomposed_implementation_steps/.test(slug) && /^\s*Anchors:/i.test(line)) priority = hasHardSignal ? "High" : "Medium"
+  if (/repo_inferred_obligations/.test(slug) && /^\s*Anchors:/i.test(line)) priority = hasHardSignal ? "High" : "Medium"
+  if (/semantic_search_code_localization|implementation_surfaces|target_functions/.test(slug) && hasHardSignal) {
+    priority = strongerPriority(priority, "High")
+  }
+  if (/test|validation|example|style|documentation/.test(lower)) priority = capPriority(priority, "Medium")
+  return priority
+}
+
+function reasonForSurfaceLine(section: SectionFile, line: string): string {
+  if (/implementation_anchors/.test(section.slug)) return "implementation anchor"
+  if (/decomposed_implementation_steps/.test(section.slug)) return "decomposed implementation step anchor"
+  if (/repo_inferred_obligations/.test(section.slug)) return "repo-inferred obligation anchor"
+  if (/semantic_search_code_localization/.test(section.slug)) return "semantic code localization"
+  if (/explicit_target_files/.test(section.slug)) return "explicit target file"
+  return `${section.slug.replace(/_/g, " ")} evidence`
+}
+
+function categoryForSurfacePath(path: string): TargetSurfaceCategory {
+  if (/^Lib\/test\//.test(path) || /\/test_|^Tools\/.*test/i.test(path)) return "test"
+  if (/^Doc\//.test(path)) return "documentation"
+  if (/^(?:Makefile\.pre\.in|configure|configure\.ac|setup\.py|Modules\/Setup|Lib\/sysconfig\.py|Python\/stdlib_module_names\.h|Tools\/scripts\/generate_stdlib_module_names\.py)$/.test(path)) {
+    return "integration"
+  }
+  if (/^(?:Parser\/parser\.c|Python\/Python-ast\.c)$/.test(path)) return "generated"
+  if (/^Tools\//.test(path)) return "reference"
+  return "implementation"
+}
+
+function hardEligibleSurfacePath(path: string): boolean {
+  const category = categoryForSurfacePath(path)
+  return category !== "test" && category !== "documentation" && category !== "reference"
+}
+
+function strongerPriority(left: TargetSurfacePriority, right: TargetSurfacePriority): TargetSurfacePriority {
+  return priorityRank(left) <= priorityRank(right) ? left : right
+}
+
+function priorityRank(priority: TargetSurfacePriority): number {
+  if (priority === "High") return 0
+  if (priority === "Medium") return 1
+  return 2
+}
+
+function capPriority(priority: TargetSurfacePriority, cap: TargetSurfacePriority): TargetSurfacePriority {
+  return priorityRank(priority) < priorityRank(cap) ? cap : priority
+}
+
+function strongerCategory(left: TargetSurfaceCategory, right: TargetSurfaceCategory): TargetSurfaceCategory {
+  if (left === right) return left
+  if (left === "implementation" || right === "implementation") return "implementation"
+  if (left === "integration" || right === "integration") return "integration"
+  if (left === "generated" || right === "generated") return "generated"
+  return left
+}
+
 function specInputManifest(data: BundleData, outputLoopDir: string): Record<string, unknown> {
   return {
     schema: "pact-spec-input-manifest/v1",
@@ -561,6 +1073,14 @@ function specInputManifest(data: BundleData, outputLoopDir: string): Record<stri
     sections_dir: data.sectionsDir,
     copied_evidence_dir: join(outputLoopDir, copiedSectionsRelativeDir),
     code_localization_file: data.codeLocalization ? join(outputLoopDir, "spec-code-localization.md") : undefined,
+    target_surfaces_file: join(outputLoopDir, "target-surfaces.json"),
+    target_surface_contract_file: join(outputLoopDir, "target-surface-contract.md"),
+    behavioral_contract_file: join(outputLoopDir, "behavioral-contract.md"),
+    coverage_obligation_file: join(outputLoopDir, "coverage-obligation.json"),
+    ultimate_goal_checklist_file: join(outputLoopDir, "ultimate-goal-checklist.json"),
+    reviewer_audit_checklist_file: join(outputLoopDir, "reviewer-audit-checklist.md"),
+    hard_target_surface_statuses: hardTargetSurfaceStatuses,
+    coverage_obligation_statuses: coverageObligationStatuses,
     core_sections: {
       original_requirement: rolePath(data, "original_requirement"),
       implementation_anchors: rolePath(data, "implementation_anchors"),
@@ -578,6 +1098,8 @@ function specInputManifest(data: BundleData, outputLoopDir: string): Record<stri
       loop_path: section.loopPath,
       sha256: sha256Text(section.content),
     })),
+    target_surfaces: data.targetSurfaces,
+    behavioral_obligations: data.behavioralObligations,
     excluded_files: excludedFiles,
   }
 }
