@@ -35,6 +35,7 @@ import {
   summarizeToolArgs,
   summarizeToolOutput,
   writeRoundContext,
+  writeRoundCheckpoint,
   writeRoundEvidence,
   writeRoundResult,
   writeRoundSnapshot,
@@ -58,6 +59,7 @@ import {
   type TrajectoryMode,
   type WorkerBackend,
 } from "./pact/pact-core"
+import { resumePactRound } from "./pact/pact-run-driver"
 
 export type PactPluginOptions = {
   plannerBackend?: PlannerBackend
@@ -313,6 +315,77 @@ ${prompt}
               workerConfigSource,
               sessionStrategy,
               trajectoryMode,
+            },
+          }
+        },
+      }),
+
+      "pact-resume-round": tool({
+        description: "Fork a PACT loop from a completed round checkpoint and continue in the current session.",
+        args: {
+          source_loop: tool.schema.string().describe("Absolute path to the source PACT loop directory."),
+          resume_round: tool.schema.number().describe("Completed source round to restore; execution continues at the next round."),
+          plan_file: tool.schema.string().describe("Target workspace plan path, relative to the project root."),
+          max_rounds: tool.schema.number().describe("Total worker-round budget; must be greater than resume_round."),
+          reviewer_backend: tool.schema.enum(["opencode-agent", "codex-cli"]).optional(),
+          reviewer_model: tool.schema.string().optional(),
+          worker_model: tool.schema.string().optional(),
+          worker_config_source: tool.schema.string().optional(),
+          session_strategy: tool.schema.enum(["new-per-round", "same-session"]).optional(),
+          full_alignment_interval: tool.schema.number().optional(),
+          verification_command: tool.schema.string().optional(),
+          verification_timeout_ms: tool.schema.number().optional(),
+        },
+        async execute(args, context) {
+          const root = context.worktree || context.directory || projectRoot
+          const sourceState = readState(args.source_loop)
+          const reviewerBackend = args.reviewer_backend ?? cfg.reviewerBackend ?? sourceState.reviewer_backend
+          const reviewerModel = args.reviewer_model ?? reviewerModelForBackend(reviewerBackend, cfg)
+          const workerModel = args.worker_model ?? cfg.workerModel ?? sourceState.worker_model ?? PACT_PLUGIN_DEFAULTS.workerModel
+          const workerConfigSource =
+            args.worker_config_source ?? cfg.workerConfigSource ?? sourceState.worker_config_source ?? PACT_PLUGIN_DEFAULTS.workerConfigSource
+          const sessionStrategy = args.session_strategy ?? cfg.sessionStrategy ?? PACT_PLUGIN_DEFAULTS.sessionStrategy
+          const resumed = resumePactRound({
+            projectRoot: root,
+            planFile: args.plan_file,
+            maxRounds: args.max_rounds,
+            sourceLoopDir: args.source_loop,
+            round: args.resume_round,
+            plannerBackend: sourceState.planner_backend,
+            plannerModel: sourceState.planner_model,
+            reviewerBackend,
+            reviewerModel,
+            workerModel,
+            workerConfigSource,
+            workerSessionID: context.sessionID,
+            workerAgent: cfg.workerAgent,
+            fullAlignmentInterval: args.full_alignment_interval ?? cfg.fullAlignmentInterval,
+            sessionStrategy,
+            roundBoundary: "session_idle",
+            verificationCommand: args.verification_command ?? cfg.verificationCommand,
+            verificationTimeoutMs: args.verification_timeout_ms ?? cfg.verificationTimeoutMs,
+          })
+          const nextRound = resumed.state.next_round ?? resumed.state.current_round
+          const prompt = readFileSync(join(resumed.loopDir, `round-${roundName(nextRound)}-prompt.md`), "utf-8")
+          return {
+            output: `PACT resumed from round ${args.resume_round}.
+
+Source loop: ${args.source_loop}
+Loop: ${resumed.loopDir}
+Round: ${roundName(nextRound)}
+Worker model: ${workerModel}
+
+Continue with this worker checkpoint now:
+
+${prompt}
+`,
+            metadata: {
+              loopDir: resumed.loopDir,
+              sourceLoop: args.source_loop,
+              sourceRound: args.resume_round,
+              round: nextRound,
+              workerModel,
+              sessionStrategy,
             },
           }
         },
@@ -819,6 +892,7 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
             })
         }
         await maybePromptNextPhase(promptClient, cfg, loop.loopDir, nextState, round)
+        writeRoundCheckpoint({ loopDir: loop.loopDir, round })
       } finally {
         processingIdle = false
       }
@@ -1403,6 +1477,7 @@ async function handleFinalizeIdle(input: {
       if (!exhausted) {
         await maybePromptNextPhase(input.client, input.cfg, input.loopDir, input.state, input.round)
       }
+      writeRoundCheckpoint({ loopDir: input.loopDir, round: input.round })
       return
     }
   }
@@ -1454,6 +1529,9 @@ async function handleFinalizeIdle(input: {
     exportReplayCase({ loopDir: input.loopDir, round: input.round })
   } catch {
     // Finalize may not have a patch artifact; the round result is still authoritative.
+  }
+  if (existsSync(artifactPaths(input.loopDir, input.round).patchArtifact)) {
+    writeRoundCheckpoint({ loopDir: input.loopDir, round: input.round })
   }
 }
 

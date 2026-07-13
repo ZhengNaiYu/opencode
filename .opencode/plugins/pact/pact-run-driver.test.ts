@@ -1,6 +1,16 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { execFileSync } from "node:child_process"
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -30,11 +40,15 @@ function tempGitProject(): string {
 
 function tempGitWorktreeProject(): string {
   const base = tempGitProject()
+  return tempGitWorktreeFor(base)
+}
+
+function tempGitWorktreeFor(base: string): string {
   const parent = mkdtempSync(join(tmpdir(), "pact-driver-worktree-parent-"))
   tempDirs.push(parent)
   const dir = join(parent, "worktree")
   const branch = `pact-test-${Date.now()}-${Math.random().toString(16).slice(2)}`
-  execFileSync("git", ["worktree", "add", "-q", "-b", branch, dir], { cwd: base })
+  execFileSync("git", ["worktree", "add", "-b", branch, dir], { cwd: base })
   return dir
 }
 
@@ -44,6 +58,16 @@ function gitInfoExcludeText(projectRoot: string): string {
     encoding: "utf-8",
   }).trim()
   return readFileSync(excludePath, "utf-8")
+}
+
+function replayLoopDir(projectRoot: string): string {
+  const loopsRoot = join(projectRoot, ".pact", "loops")
+  const loopID = readdirSync(loopsRoot)
+    .filter((item) => item.includes("-resume-r"))
+    .sort()
+    .at(-1)
+  if (!loopID) throw new Error("replay loop was not initialized")
+  return join(loopsRoot, loopID)
 }
 
 function validPlannerOutput(): string {
@@ -215,15 +239,18 @@ describe("PACT run driver", () => {
     }
   })
 
-  test("parses round0 resume loop from CLI or environment", () => {
+  test("parses round0 and round checkpoint resume inputs", () => {
     const oldResume = process.env.PACT_RESUME_LOOP_DIR
     const oldMode = process.env.PACT_RESUME_MODE
+    const oldRound = process.env.PACT_RESUME_ROUND
     process.env.PACT_RESUME_LOOP_DIR = "/tmp/archive/loops/L"
-    process.env.PACT_RESUME_MODE = "round0"
+    process.env.PACT_RESUME_MODE = "round"
+    process.env.PACT_RESUME_ROUND = "3"
     try {
       const fromEnv = cliArgs(["--plan-file", "/tmp/PROMPT.md"])
       expect(fromEnv.resumeLoopDir).toBe("/tmp/archive/loops/L")
-      expect(fromEnv.resumeMode).toBe("round0")
+      expect(fromEnv.resumeMode).toBe("round")
+      expect(fromEnv.resumeRound).toBe(3)
 
       const fromCli = cliArgs([
         "--plan-file",
@@ -231,15 +258,25 @@ describe("PACT run driver", () => {
         "--resume-loop",
         "/tmp/other/loops/M",
         "--resume-mode",
-        "round0",
+        "round",
+        "--resume-round",
+        "1",
       ])
       expect(fromCli.resumeLoopDir).toBe("/tmp/other/loops/M")
-      expect(fromCli.resumeMode).toBe("round0")
+      expect(fromCli.resumeMode).toBe("round")
+      expect(fromCli.resumeRound).toBe(1)
+
+      process.env.PACT_RESUME_ROUND = ""
+      const round0 = cliArgs(["--plan-file", "/tmp/PROMPT.md", "--resume-mode", "round0"])
+      expect(round0.resumeMode).toBe("round0")
+      expect(round0.resumeRound).toBeUndefined()
     } finally {
       if (oldResume === undefined) delete process.env.PACT_RESUME_LOOP_DIR
       else process.env.PACT_RESUME_LOOP_DIR = oldResume
       if (oldMode === undefined) delete process.env.PACT_RESUME_MODE
       else process.env.PACT_RESUME_MODE = oldMode
+      if (oldRound === undefined) delete process.env.PACT_RESUME_ROUND
+      else process.env.PACT_RESUME_ROUND = oldRound
     }
   })
 
@@ -478,6 +515,115 @@ Continue source changes.
     expect(calls[0]?.input).toContain("Spec code localization")
     expect(calls[0]?.input).toContain("Target surface contract")
     expect(calls[0]?.input).toContain("Hard Target Surface Completion Gate")
+  })
+
+  test("resumes from a verified round checkpoint in a fresh workspace", () => {
+    const sourceProject = tempGitProject()
+    const project = tempGitWorktreeFor(sourceProject)
+    let sourceLoopDir = ""
+    const source = runPactDriver({
+      projectRoot: sourceProject,
+      planFile: join(sourceProject, "plan.md"),
+      model: "zai-coding-plan/glm-5-turbo",
+      maxRounds: 3,
+      maxInvocations: 1,
+      opencodeCommand: "fake-opencode",
+      planner(_prompt, context) {
+        sourceLoopDir = context.loopDir
+        return validPlannerOutput()
+      },
+      reviewer() {
+        return "### Decision Summary\nContinue.\n"
+      },
+      spawnSync() {
+        appendFileSync(join(sourceProject, "src.txt"), "round one change\n", "utf-8")
+        writeFileSync(join(sourceLoopDir, "round-01-summary.md"), "# Round 01 Summary\nImplemented round one.\n", "utf-8")
+        return { status: 0, stdout: "worker run\n", stderr: "" }
+      },
+    })
+
+    expect(source.status).toBe("max_invocations")
+    expect(existsSync(join(sourceLoopDir, "round-01-checkpoint.json"))).toBe(true)
+    expect(existsSync(join(sourceLoopDir, "round-01-plan-post.md"))).toBe(true)
+    const checkpoint = JSON.parse(readFileSync(join(sourceLoopDir, "round-01-checkpoint.json"), "utf-8"))
+    expect(checkpoint.next_round).toBe(2)
+    expect(checkpoint.state.completed_worker_rounds).toBe(1)
+    writeFileSync(join(sourceLoopDir, "plan.md"), "# Later round plan that must not leak\n", "utf-8")
+
+    const planPostPath = join(sourceLoopDir, "round-01-plan-post.md")
+    const planPost = readFileSync(planPostPath, "utf-8")
+    writeFileSync(planPostPath, `${planPost}\ntampered\n`, "utf-8")
+    expect(() =>
+      runPactDriver({
+        projectRoot: project,
+        planFile: join(project, "plan.md"),
+        model: "zai-coding-plan/glm-5-turbo",
+        maxRounds: 2,
+        resumeLoopDir: sourceLoopDir,
+        resumeMode: "round",
+        resumeRound: 1,
+      }),
+    ).toThrow("plan ledger hash mismatch")
+    writeFileSync(planPostPath, planPost, "utf-8")
+
+    const mismatchedProject = tempGitWorktreeFor(sourceProject)
+    appendFileSync(join(mismatchedProject, "src.txt"), "different base\n", "utf-8")
+    execFileSync("git", ["add", "src.txt"], { cwd: mismatchedProject })
+    execFileSync("git", ["commit", "-m", "different base"], { cwd: mismatchedProject })
+    expect(() =>
+      runPactDriver({
+        projectRoot: mismatchedProject,
+        planFile: join(mismatchedProject, "plan.md"),
+        model: "zai-coding-plan/glm-5-turbo",
+        maxRounds: 2,
+        resumeLoopDir: sourceLoopDir,
+        resumeMode: "round",
+        resumeRound: 1,
+      }),
+    ).toThrow("base commit mismatch")
+
+    const calls: Array<{ input: string; workspaceBeforeRound: string }> = []
+    const replay = runPactDriver({
+      projectRoot: project,
+      planFile: join(project, "plan.md"),
+      model: "zai-coding-plan/glm-5-turbo",
+      maxRounds: 2,
+      maxInvocations: 1,
+      opencodeCommand: "fake-opencode",
+      resumeLoopDir: sourceLoopDir,
+      resumeMode: "round",
+      resumeRound: 1,
+      planner() {
+        throw new Error("planner should not be called for round checkpoint resume")
+      },
+      reviewer() {
+        return "### Decision Summary\nContinue.\n"
+      },
+      spawnSync(_command, _args, options) {
+        calls.push({ input: options.input, workspaceBeforeRound: readFileSync(join(project, "src.txt"), "utf-8") })
+        appendFileSync(join(project, "src.txt"), "round two change\n", "utf-8")
+        writeFileSync(
+          join(replayLoopDir(project), "round-02-summary.md"),
+          "# Round 02 Summary\nImplemented round two.\n",
+          "utf-8",
+        )
+        return { status: 0, stdout: "worker replay\n", stderr: "" }
+      },
+    })
+
+    expect(replay.status).toBe("stopped")
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.input).toContain("# PACT Round 02")
+    expect(calls[0]?.workspaceBeforeRound).toBe("before\nround one change\n")
+    expect(replay.loopDir).toBeDefined()
+    expect(readFileSync(join(replay.loopDir!, "plan.md"), "utf-8")).not.toContain("Later round plan")
+    expect(readState(replay.loopDir!).completed_worker_rounds).toBe(2)
+    const manifest = JSON.parse(readFileSync(join(replay.loopDir!, "loop-manifest.json"), "utf-8"))
+    expect(manifest.resume_mode).toBe("round")
+    expect(manifest.resume_source_round).toBe(1)
+    expect(manifest.resume_source_loop_id).toBe(checkpoint.loop_id)
+    expect(manifest.inherited_worker_rounds).toBe(1)
+    expect(existsSync(join(replay.loopDir!, "resume-source-round-checkpoint.json"))).toBe(true)
   })
 
   test("OpenCode planner and reviewer backends use explicit models and agents", () => {

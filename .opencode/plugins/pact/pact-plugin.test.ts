@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -14,7 +15,17 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import PactPluginModule, { PactPlugin, PACT_PLUGIN_DEFAULTS, invokeCodexPlanner, invokeCodexReviewer } from "../pact"
-import { artifactPaths, createLoop, readState, sha256Text, writeRoundContext, writeState } from "./pact-core"
+import {
+  artifactPaths,
+  capturePatchArtifact,
+  createLoop,
+  readState,
+  sha256Text,
+  writeRoundCheckpoint,
+  writeRoundContext,
+  writeRoundResult,
+  writeState,
+} from "./pact-core"
 
 const tempDirs: string[] = []
 
@@ -40,6 +51,18 @@ function tempGitProject(): string {
   execFileSync("git", ["add", "plan.md", "src.txt"], { cwd: dir })
   execFileSync("git", ["commit", "-m", "init"], { cwd: dir })
   return dir
+}
+
+function tempGitWorktreeFor(base: string): string {
+  const parent = mkdtempSync(join(tmpdir(), "pact-plugin-worktree-parent-"))
+  tempDirs.push(parent)
+  const worktree = join(parent, "worktree")
+  execFileSync(
+    "git",
+    ["worktree", "add", "-b", `pact-plugin-${Date.now()}-${Math.random().toString(16).slice(2)}`, worktree],
+    { cwd: base },
+  )
+  return worktree
 }
 
 function fakeCodex(project: string, output: string, status = 0): string {
@@ -226,6 +249,67 @@ function fakeClient(output = ""): {
 describe("PACT Codex planner and reviewer", () => {
   test("exports a v1 server plugin module for OpenCode plugin loading", () => {
     expect(PactPluginModule).toMatchObject({ id: "pact", server: PactPlugin })
+  })
+
+  test("pact-resume-round restores a checkpoint and returns the next worker prompt", async () => {
+    const sourceProject = tempGitProject()
+    const project = tempGitWorktreeFor(sourceProject)
+    const sourceLoop = createLoop({
+      projectRoot: sourceProject,
+      planFile: join(sourceProject, "plan.md"),
+      maxRounds: 3,
+      workerSessionID: "ses_source",
+      sessionStrategy: "new-per-round",
+      roundBoundary: "session_idle",
+    })
+    appendFileSync(join(sourceProject, "src.txt"), "round one change\n", "utf-8")
+    const patch = capturePatchArtifact({
+      projectRoot: sourceProject,
+      loopDir: sourceLoop.loopDir,
+      loopID: sourceLoop.loopID,
+      round: 1,
+    })
+    const sourceState = readState(sourceLoop.loopDir)
+    sourceState.next_round = 2
+    sourceState.current_round = 2
+    sourceState.attempted_worker_rounds = 1
+    sourceState.completed_worker_rounds = 1
+    sourceState.reviewed_worker_rounds = 1
+    sourceState.worker_round_count = 1
+    writeState(sourceLoop.loopDir, sourceState)
+    writeFileSync(join(sourceLoop.loopDir, "round-02-prompt.md"), "# PACT Round 02 Worker Prompt\n", "utf-8")
+    writeRoundResult({
+      loopDir: sourceLoop.loopDir,
+      loopID: sourceLoop.loopID,
+      round: 1,
+      status: "running",
+      loopPhase: "implementation",
+      failure: null,
+      metrics: { patch_lines: patch.workspace_patch.lines },
+    })
+    writeRoundCheckpoint({ loopDir: sourceLoop.loopDir, round: 1 })
+
+    const hooks = await PactPlugin({ client: {}, directory: project, worktree: project } as any)
+    const result = (await hooks.tool?.["pact-resume-round"].execute(
+      {
+        source_loop: sourceLoop.loopDir,
+        resume_round: 1,
+        plan_file: "plan.md",
+        max_rounds: 3,
+      },
+      { sessionID: "ses_resume", directory: project, worktree: project } as any,
+    )) as { output: string; metadata: { loopDir: string; round: number } }
+
+    expect(result.output).toContain("PACT resumed from round 1")
+    expect(result.output).toContain("# PACT Round 02 Worker Prompt")
+    expect(result.metadata.round).toBe(2)
+    expect(readFileSync(join(project, "src.txt"), "utf-8")).toBe("before\nround one change\n")
+    const state = readState(result.metadata.loopDir)
+    expect(state.active_round_session_id).toBe("ses_resume")
+    expect(state.round_boundary).toBe("session_idle")
+    const context = JSON.parse(readFileSync(join(result.metadata.loopDir, "round-02-context.json"), "utf-8"))
+    expect(context.session_id).toBe("ses_resume")
+    expect(readdirSync(join(project, ".pact", "loops"))).toContain(result.metadata.loopDir.split("/").at(-1))
   })
 
   test("defaults to codex-cli planner with gpt-5.5 in the project root", () => {

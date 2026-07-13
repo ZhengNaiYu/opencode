@@ -10,6 +10,8 @@ For CLI and LoLBench, the default round boundary is driver-owned `opencode run` 
 
 For retries after planner or outer timeout cost has already been paid, the driver supports explicit Round00 resume. `--resume-loop <loopDir>` / `PACT_RESUME_LOOP_DIR` with `round0` mode validates an existing Round00 package, creates a fresh loop in the target workspace, copies canonical plan/todo/goal-tracker artifacts, records the resume source, regenerates `round-01-prompt.md`, and starts directly at round1. This keeps the benchmark workspace clean while avoiding a second planner call.
 
+For stability and reproducibility evaluation, every completed worker round now writes an authoritative post-round checkpoint. `--resume-loop <loopDir> --resume-mode round --resume-round <N>` (or `PACT_RESUME_MODE=round` plus `PACT_RESUME_ROUND=<N>`) validates the checkpoint and source hashes, requires the target workspace to have the same Git `base_commit`, applies the cumulative `round-NN-workspace.patch`, verifies the restored workspace hash, restores the post-review plan/todo/goal-tracker and PACT state, clears historical session IDs, and starts a new independent loop at round `N+1`. The source loop remains unchanged. `max_rounds` remains the total worker-round budget, so it must be greater than `N`.
+
 For LoLBench tasks with external requirement decomposition and code localization output, Round00 can be produced by the deterministic spec importer instead of an LLM planner. The local v14 preprocessing data is documented in `docs/pact/opencode-pact-spec-import.md`; generated loops live under `/Users/gujiazhen/Documents/cc_codes/outputs/lolbench_pact_round0_imports_v14_opencode_best/<CASE>/spec-import-round0` and are consumed through the same `--pact-resume-loop` Round00 resume path.
 
 In benchmark strict mode, worker prompts and tool reads are separated from reviewer-only evidence. The worker can read canonical plan/ledger files, its prompt, contract, summary, continuation package, and pre-snapshot. Raw feedback, verification logs, replay bundles, event logs, evidence, review outputs, and captured patches remain available for the driver, reviewer, reports, and humans, but are not fed back into worker rounds by default.
@@ -43,6 +45,7 @@ v1 adds a small artifact chain under `.pact/loops/<loopID>/` so every round can 
 | Loop Start            | Plan file, project root, worker session, max rounds, full alignment interval, planner backend/model, reviewer backend/model, worker backend/model/config source | `state.json`, `loop-manifest.json`, `plan.md`, `todo.md`, `goal-tracker.md`, workspace `.git/info/exclude` | Establish run identity, goal, plan anchor, active session, worker attribution, and loop phase. |
 | Round00 Spec Import   | External LoLBench requirement decomposition bundle, project root, max rounds, worker/reviewer config | `state.json`, `loop-manifest.json`, `source-plan.md`, `plan.md`, `todo.md`, `goal-tracker.md`, `round-00-result.json`, `spec-input-manifest.json`, copied spec slices | Deterministically seed canonical Round00 artifacts without calling the planner.                |
 | Round00 Resume        | Existing loop directory with complete Round00 package, fresh project root, max rounds, current worker/reviewer config       | `state.json`, `loop-manifest.json`, `resume-source-loop-manifest.json`, copied Round00 files, regenerated `round-01-prompt.md`, workspace `.git/info/exclude` | Restart from canonical planning without re-running planner or reusing partial worker output.  |
+| Round Checkpoint Resume | Existing loop directory with a verified `round-NN-checkpoint.json`, fresh project root at the same base commit, resume round and total max rounds | Restored cumulative workspace, post-round ledgers/state, regenerated round `N+1` prompt, lineage fields in `loop-manifest.json`, `resume-source-round-checkpoint.json` | Fork an independent replay from the exact reviewed boundary after round N. |
 | Round Start           | Current state, todo, goal tracker, previous feedback                                                                        | `round-XX-state.json`, `round-XX-context.json`                                                             | Explain the checkpoint input and provide replay context.                                     |
 | Worker Execution      | Worker prompt, repository state, summarized tool events                                                                     | `round-XX-events.jsonl`, `round-XX-contract.md`, `round-XX-summary.md`                                      | Show key actions, worker-declared scope, and detect missing summary or worker failure.        |
 | Patch Capture         | Repository diff at round end                                                                                                | `round-XX-workspace.patch`, `round-XX-eval.patch`, `round-XX-test.patch`, `round-XX-patch-artifact.json`    | Determine empty patch, changed files, patch hash, and replay or eval candidate.              |
@@ -104,6 +107,19 @@ The new loop's own `loop-manifest.json` records:
 - `round0_reused`: `true`
 
 Purpose: preserve provenance when a fresh workspace reuses an existing canonical Round00 package and restarts from round1.
+
+### `round-XX-checkpoint.json` and post-round ledger snapshots
+
+Each reviewed round boundary writes:
+
+- `round-XX-checkpoint.json`
+- `round-XX-plan-post.md`
+- `round-XX-todo-post.md`
+- `round-XX-goal-tracker-post.md`
+
+The checkpoint contains the full PACT state at that boundary, `base_commit`, cumulative workspace patch metadata, hashes for all post-round ledgers, and hashes for the next prompt, feedback, and continuation package when present. These files are PACT-owned and reviewer-only. They are the authoritative source for exact round resume; mutable top-level ledgers and the optional `.round-history` mirror are not used as historical restore inputs.
+
+Round resume rejects missing or altered checkpoint files, a different target `HEAD`, a failed `git apply --check`, a restored workspace hash mismatch, terminal completion checkpoints, and stopped checkpoints other than an extendable max-round stop. Hidden final-gate artifacts are never copied into worker continuation input.
 
 ### `round-XX-state.json`
 
@@ -391,6 +407,30 @@ Minimum fields:
 - `baseline_result`
 
 Purpose: freeze a checkpoint so later work can repeat it N times or compare mechanism variants.
+
+## Resume From a Completed Round
+
+Run the driver in a fresh workspace for the same case and base commit:
+
+```bash
+bun .opencode/plugins/pact/pact-run-driver.ts \
+  --project-root /path/to/factor_analysis_replay_from_round1 \
+  --plan-file /path/to/factor_analysis_replay_from_round1/PROMPT.md \
+  --max-rounds 12 \
+  --resume-loop /path/to/factor_analysis/.pact/loops/<loop-id> \
+  --resume-mode round \
+  --resume-round 1
+```
+
+This restores the reviewed state after round 1 and invokes the next worker with a regenerated round 2 prompt. The destination loop manifest records the source loop, source round, checkpoint hash, and inherited worker-round count so the original and replay runs can be compared without relying on directory names.
+
+When the PACT plugin is loaded in an interactive OpenCode workspace, use the equivalent command in the chat input:
+
+```text
+/pact-resume /path/to/factor_analysis/.pact/loops/<loop-id> 1 plan.md --max 12 --worker-model yunwu/claude-opus-4-8
+```
+
+The positional arguments are source loop directory, completed source round, and the target workspace plan file. The command restores the checkpoint and returns the round `N+1` worker prompt to the current session.
 
 ## Default Behavior
 

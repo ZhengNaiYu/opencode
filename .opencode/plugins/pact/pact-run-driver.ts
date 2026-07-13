@@ -31,9 +31,11 @@ import {
   recordFailedReviewDecision,
   recordReviewDecision,
   roundName,
+  sha256Text,
   summaryPath,
   writeContinuationPackage,
   writeRoundContext,
+  writeRoundCheckpoint,
   writeRoundEvidence,
   writeRoundResult,
   writeRoundSnapshot,
@@ -49,6 +51,8 @@ import {
   type PlannerValidationResult,
   type RoundVerificationArtifact,
   type ReviewerBackend,
+  type RoundBoundary,
+  type RoundCheckpointArtifact,
   type SessionStrategy,
   validatePlannerArtifacts,
 } from "./pact-core"
@@ -69,7 +73,7 @@ type SpawnSyncLike = (
 ) => SpawnResult
 
 type WorkerRunner = "host" | "docker"
-type ResumeMode = "round0"
+type ResumeMode = "round0" | "round"
 
 type PactDriverResult = {
   status: LoopStatus | "no_loop" | "opencode_failed" | "missing_prompt" | "max_invocations"
@@ -162,6 +166,7 @@ export function runPactDriver(input: {
   verificationTimeoutMs?: number
   resumeLoopDir?: string
   resumeMode?: ResumeMode
+  resumeRound?: number
   spawnSync?: SpawnSyncLike
   planner?: DriverPlanner
   reviewer?: DriverReviewer
@@ -196,6 +201,7 @@ export function runPactDriver(input: {
     verificationTimeoutMs: input.verificationTimeoutMs,
     resumeLoopDir: input.resumeLoopDir,
     resumeMode: input.resumeMode,
+    resumeRound: input.resumeRound,
     opencodeCommand: input.opencodeCommand ?? "opencode",
     spawnSync: spawn,
     planner: input.planner,
@@ -310,6 +316,49 @@ export function runPactDriver(input: {
   }
 }
 
+export function resumePactRound(input: {
+  projectRoot: string
+  planFile: string
+  maxRounds: number
+  sourceLoopDir: string
+  round: number
+  plannerBackend: PlannerBackend
+  plannerModel: string | null
+  reviewerBackend: ReviewerBackend
+  reviewerModel: string | null
+  workerModel: string
+  workerConfigSource?: string
+  workerSessionID?: string
+  workerAgent?: string
+  fullAlignmentInterval?: number
+  sessionStrategy?: SessionStrategy
+  roundBoundary?: RoundBoundary
+  verificationCommand?: string
+  verificationTimeoutMs?: number
+}): { loopDir: string; state: PactState } {
+  return initializeDriverLoopFromRound({
+    projectRoot: input.projectRoot,
+    planFile: input.planFile,
+    maxRounds: input.maxRounds,
+    plannerBackend: input.plannerBackend,
+    plannerModel: input.plannerModel,
+    reviewerBackend: input.reviewerBackend,
+    reviewerModel: input.reviewerModel,
+    workerModel: input.workerModel,
+    workerConfigSource: input.workerConfigSource,
+    workerSessionID: input.workerSessionID,
+    workerAgent: input.workerAgent,
+    fullAlignmentInterval: input.fullAlignmentInterval,
+    sessionStrategy: input.sessionStrategy,
+    roundBoundary: input.roundBoundary,
+    verificationCommand: input.verificationCommand,
+    verificationTimeoutMs: input.verificationTimeoutMs,
+    resumeLoopDir: input.sourceLoopDir,
+    resumeMode: "round",
+    resumeRound: input.round,
+  })
+}
+
 function initializeDriverLoop(input: {
   projectRoot: string
   planFile: string
@@ -322,19 +371,30 @@ function initializeDriverLoop(input: {
   reviewerAgent: string
   workerModel: string
   workerConfigSource?: string
+  workerSessionID?: string
+  workerAgent?: string
   fullAlignmentInterval?: number
   sessionStrategy?: SessionStrategy
+  roundBoundary?: RoundBoundary
   verificationCommand?: string
   verificationTimeoutMs?: number
   resumeLoopDir?: string
   resumeMode?: ResumeMode
+  resumeRound?: number
   opencodeCommand: string
   spawnSync: SpawnSyncLike
   planner?: DriverPlanner
 }): { loopDir: string; state: PactState } {
-  if (input.resumeLoopDir) {
-    return initializeDriverLoopFromRound0(input)
+  if ((input.resumeMode || input.resumeRound !== undefined) && !input.resumeLoopDir) {
+    throw new Error("PACT resume mode/round requires --resume-loop")
   }
+  if (input.resumeMode === "round0" && input.resumeRound !== undefined) {
+    throw new Error("PACT round0 resume does not accept --resume-round")
+  }
+  if (input.resumeLoopDir && (input.resumeMode === "round" || input.resumeRound !== undefined)) {
+    return initializeDriverLoopFromRound(input)
+  }
+  if (input.resumeLoopDir) return initializeDriverLoopFromRound0(input)
   const loop = createLoop({
     projectRoot: input.projectRoot,
     planFile: input.planFile,
@@ -450,8 +510,11 @@ function initializeDriverLoopFromRound0(input: {
   reviewerModel: string | null
   workerModel: string
   workerConfigSource?: string
+  workerSessionID?: string
+  workerAgent?: string
   fullAlignmentInterval?: number
   sessionStrategy?: SessionStrategy
+  roundBoundary?: RoundBoundary
   verificationCommand?: string
   verificationTimeoutMs?: number
   resumeLoopDir?: string
@@ -561,10 +624,263 @@ function validateRound0ResumeSource(loopDir: string): void {
   }
 }
 
-function allocateResumeLoopDir(projectRoot: string, sourceLoopID: string): string {
+function initializeDriverLoopFromRound(input: {
+  projectRoot: string
+  planFile: string
+  maxRounds: number
+  plannerBackend: PlannerBackend
+  plannerModel: string | null
+  reviewerBackend: ReviewerBackend
+  reviewerModel: string | null
+  workerModel: string
+  workerConfigSource?: string
+  workerSessionID?: string
+  workerAgent?: string
+  fullAlignmentInterval?: number
+  sessionStrategy?: SessionStrategy
+  roundBoundary?: RoundBoundary
+  verificationCommand?: string
+  verificationTimeoutMs?: number
+  resumeLoopDir?: string
+  resumeMode?: ResumeMode
+  resumeRound?: number
+}): { loopDir: string; state: PactState } {
+  const sourceLoopDir = resolve(input.resumeLoopDir ?? "")
+  const round = input.resumeRound
+  if (!Number.isInteger(round) || round === undefined || round < 1) {
+    throw new Error("PACT round resume requires --resume-round with an integer greater than zero")
+  }
+  if (input.maxRounds <= round) {
+    throw new Error(`PACT round resume requires max_rounds greater than resume round ${round}`)
+  }
+  const checkpoint = validateRoundResumeSource(sourceLoopDir, round)
+  ensureGitInfoExclude(input.projectRoot, ".pact/")
+  ensureGitInfoExclude(input.projectRoot, "/*.patch")
+  ensureGitInfoExclude(input.projectRoot, "/*.diff")
+  validateResumeBaseCommit(input.projectRoot, checkpoint)
+  const sourceLoopID = checkpoint.loop_id || basename(sourceLoopDir)
+  const loopDir = allocateResumeLoopDir(input.projectRoot, sourceLoopID, round)
+  const loopID = basename(loopDir)
+  copyRound0ResumePackage(sourceLoopDir, loopDir)
+  restoreRoundCheckpointLedgers(sourceLoopDir, loopDir, round, checkpoint)
+  rewriteResumeSpecInputManifest(loopDir)
+  applyRoundCheckpointPatch(input.projectRoot, sourceLoopDir, loopDir, loopID, round, checkpoint)
+  copyInheritedRoundArtifacts(sourceLoopDir, loopDir, round)
+
+  const now = new Date().toISOString()
+  const resumableStopped = checkpoint.state.status === "stopped" && checkpoint.state.phase === "stopped"
+  const state: PactState = {
+    ...checkpoint.state,
+    version: 2,
+    status: "running",
+    phase: resumableStopped ? "implementation" : checkpoint.state.phase,
+    loop_id: loopID,
+    next_round: round + 1,
+    current_round: round + 1,
+    max_rounds: input.maxRounds,
+    full_alignment_interval: Math.max(
+      2,
+      input.fullAlignmentInterval ?? checkpoint.state.full_alignment_interval ?? 5,
+    ),
+    plan_file: input.planFile,
+    source_plan_file: input.planFile,
+    source_plan_path: join(loopDir, "source-plan.md"),
+    active_session_id: input.workerSessionID,
+    active_round_session_id: input.workerSessionID,
+    previous_round_session_id: undefined,
+    session_strategy: input.sessionStrategy ?? checkpoint.state.session_strategy ?? "new-per-round",
+    round_boundary: input.roundBoundary ?? "run_exit",
+    reviewer_backend: input.reviewerBackend,
+    reviewer_model: input.reviewerModel,
+    worker_backend: "opencode-cli",
+    worker_model: input.workerModel,
+    worker_config_source: input.workerConfigSource,
+    verification_command: input.verificationCommand,
+    verification_timeout_ms: input.verificationTimeoutMs,
+    created_at: now,
+    updated_at: now,
+    last_review_path: existsSync(join(loopDir, `round-${roundName(round)}-review.md`))
+      ? join(loopDir, `round-${roundName(round)}-review.md`)
+      : undefined,
+    last_feedback_path: existsSync(join(loopDir, `round-${roundName(round)}-feedback.md`))
+      ? join(loopDir, `round-${roundName(round)}-feedback.md`)
+      : undefined,
+    stop_reason: undefined,
+  }
+  writeState(loopDir, state)
+  writeRoundResumeManifest({
+    loopDir,
+    loopID,
+    sourceLoopDir,
+    sourceLoopID,
+    sourceRound: round,
+    projectRoot: input.projectRoot,
+    planFile: input.planFile,
+    checkpoint,
+    state,
+  })
+  writeNextPromptAfterDriverRound({
+    projectRoot: input.projectRoot,
+    loopDir,
+    state,
+    reviewedRound: round,
+    agent: input.workerAgent,
+    model: input.workerModel,
+  })
+  const promptPath = join(loopDir, `round-${roundName(round + 1)}-prompt.md`)
+  if (!existsSync(promptPath)) {
+    throw new Error(`PACT round ${round} checkpoint cannot produce a round ${round + 1} prompt`)
+  }
+  commitRoundHistory(loopDir, round, `round-${roundName(round)} resumed from checkpoint`)
+  return { loopDir, state: readState(loopDir) }
+}
+
+function validateRoundResumeSource(loopDir: string, round: number): RoundCheckpointArtifact {
+  const paths = artifactPaths(loopDir, round)
+  const required = [
+    "loop-manifest.json",
+    "source-plan.md",
+    `round-${roundName(round)}-checkpoint.json`,
+    `round-${roundName(round)}-workspace.patch`,
+    `round-${roundName(round)}-patch-artifact.json`,
+    `round-${roundName(round)}-result.json`,
+  ]
+  const missing = required.filter((fileName) => !existsSync(join(loopDir, fileName)))
+  if (missing.length) {
+    throw new Error(`PACT round ${round} resume source is incomplete: ${missing.join(", ")} missing in ${loopDir}`)
+  }
+  const checkpoint = JSON.parse(readFileSync(paths.roundCheckpoint, "utf-8")) as RoundCheckpointArtifact
+  if (checkpoint.schema !== "pact-round-checkpoint/v1" || checkpoint.round !== round) {
+    throw new Error(`PACT round ${round} checkpoint schema or round does not match ${paths.roundCheckpoint}`)
+  }
+  if (!checkpoint.base_commit) throw new Error(`PACT round ${round} checkpoint is missing base_commit`)
+  if (checkpoint.next_round !== round + 1 || checkpoint.state.next_round !== round + 1) {
+    throw new Error(`PACT round ${round} checkpoint has an invalid next_round cursor`)
+  }
+  if (checkpoint.state.status === "complete" || checkpoint.state.phase === "complete") {
+    throw new Error(`PACT round ${round} checkpoint is terminal and cannot be resumed`)
+  }
+  if (checkpoint.state.status === "stopped") validateStoppedRoundCheckpoint(paths.roundResult)
+  validateCheckpointFile(paths.workspacePatch, checkpoint.workspace_patch.sha256, "workspace patch")
+  validateCheckpointFile(paths.roundResult, checkpoint.round_result.sha256, "round result")
+  if (checkpoint.review_decision) {
+    validateCheckpointFile(paths.reviewDecision, checkpoint.review_decision.sha256, "review decision")
+  }
+  validateCheckpointFile(paths.planPost, checkpoint.ledgers.plan.sha256, "plan ledger")
+  validateCheckpointFile(paths.todoPost, checkpoint.ledgers.todo.sha256, "todo ledger")
+  validateCheckpointFile(paths.goalTrackerPost, checkpoint.ledgers.goal_tracker.sha256, "goal tracker")
+  if (checkpoint.feedback) {
+    validateCheckpointFile(
+      join(loopDir, `round-${roundName(round)}-feedback.md`),
+      checkpoint.feedback.sha256,
+      "review feedback",
+    )
+  }
+  if (checkpoint.continuation_package) {
+    validateCheckpointFile(paths.continuationPackage, checkpoint.continuation_package.sha256, "continuation package")
+  }
+  if (checkpoint.next_prompt) {
+    validateCheckpointFile(
+      join(loopDir, `round-${roundName(round + 1)}-prompt.md`),
+      checkpoint.next_prompt.sha256,
+      "next prompt",
+    )
+  }
+  return checkpoint
+}
+
+function validateStoppedRoundCheckpoint(resultPath: string): void {
+  const result = JSON.parse(readFileSync(resultPath, "utf-8")) as { failure_category?: string | null }
+  if (["max_rounds", "max_rounds_without_build_success"].includes(result.failure_category ?? "")) return
+  throw new Error(`PACT stopped checkpoint is not safely resumable: ${result.failure_category ?? "unknown"}`)
+}
+
+function validateCheckpointFile(filePath: string, expectedSha256: string, label: string): void {
+  if (!existsSync(filePath)) throw new Error(`PACT checkpoint ${label} is missing: ${filePath}`)
+  const actual = sha256Text(readFileSync(filePath, "utf-8"))
+  if (actual !== expectedSha256) {
+    throw new Error(`PACT checkpoint ${label} hash mismatch: expected ${expectedSha256}, got ${actual}`)
+  }
+}
+
+function validateResumeBaseCommit(projectRoot: string, checkpoint: RoundCheckpointArtifact): void {
+  const result = nodeSpawnSync("git", ["rev-parse", "HEAD"], { cwd: projectRoot, encoding: "utf-8" })
+  if (result.error || result.status !== 0) throw new Error(`PACT resume cannot read target HEAD: ${result.stderr}`)
+  const targetHead = result.stdout.trim()
+  if (targetHead !== checkpoint.base_commit) {
+    throw new Error(`PACT resume base commit mismatch: source ${checkpoint.base_commit}, target ${targetHead}`)
+  }
+}
+
+function restoreRoundCheckpointLedgers(
+  sourceLoopDir: string,
+  targetLoopDir: string,
+  round: number,
+  checkpoint: RoundCheckpointArtifact,
+): void {
+  const source = artifactPaths(sourceLoopDir, round)
+  const ledgers = [
+    [source.planPost, join(targetLoopDir, "plan.md"), checkpoint.ledgers.plan.sha256],
+    [source.todoPost, join(targetLoopDir, "todo.md"), checkpoint.ledgers.todo.sha256],
+    [source.goalTrackerPost, join(targetLoopDir, "goal-tracker.md"), checkpoint.ledgers.goal_tracker.sha256],
+  ] as const
+  for (const [sourcePath, targetPath, sha256] of ledgers) {
+    validateCheckpointFile(sourcePath, sha256, basename(targetPath))
+    copyFileSync(sourcePath, targetPath)
+  }
+}
+
+function applyRoundCheckpointPatch(
+  projectRoot: string,
+  sourceLoopDir: string,
+  targetLoopDir: string,
+  targetLoopID: string,
+  round: number,
+  checkpoint: RoundCheckpointArtifact,
+): void {
+  const patchText = readFileSync(artifactPaths(sourceLoopDir, round).workspacePatch, "utf-8")
+  if (patchText) {
+    runGitApply(projectRoot, patchText, true)
+    runGitApply(projectRoot, patchText, false)
+  }
+  const restored = capturePatchArtifact({
+    projectRoot,
+    loopDir: targetLoopDir,
+    loopID: targetLoopID,
+    round,
+  })
+  if (restored.workspace_patch.sha256 !== checkpoint.workspace_patch.sha256) {
+    throw new Error(
+      `PACT restored workspace hash mismatch: expected ${checkpoint.workspace_patch.sha256}, got ${restored.workspace_patch.sha256}`,
+    )
+  }
+}
+
+function runGitApply(projectRoot: string, patchText: string, check: boolean): void {
+  const args = ["apply", ...(check ? ["--check"] : []), "--binary", "--whitespace=nowarn", "-"]
+  const result = nodeSpawnSync("git", args, {
+    cwd: projectRoot,
+    input: patchText,
+    encoding: "utf-8",
+    maxBuffer: 20 * 1024 * 1024,
+  })
+  if (!result.error && result.status === 0) return
+  throw new Error(`PACT resume git ${args.join(" ")} failed: ${result.error ?? result.stderr.trim()}`)
+}
+
+function copyInheritedRoundArtifacts(sourceLoopDir: string, targetLoopDir: string, round: number): void {
+  for (const fileName of readdirSync(sourceLoopDir)) {
+    const match = /^round-(\d+)-/.exec(fileName)
+    if (!match || Number(match[1]) > round) continue
+    const sourcePath = join(sourceLoopDir, fileName)
+    if (statSync(sourcePath).isFile()) copyFileSync(sourcePath, join(targetLoopDir, fileName))
+  }
+}
+
+function allocateResumeLoopDir(projectRoot: string, sourceLoopID: string, round?: number): string {
   const loopsRoot = join(projectRoot, ".pact", "loops")
   mkdirSync(loopsRoot, { recursive: true })
-  const base = `${sourceLoopID}-resume`
+  const base = `${sourceLoopID}-resume${round === undefined ? "" : `-r${roundName(round)}`}`
   for (let attempt = 1; ; attempt++) {
     const suffix = attempt === 1 ? "" : `-${String(attempt).padStart(2, "0")}`
     const loopDir = join(loopsRoot, `${base}${suffix}`)
@@ -746,6 +1062,70 @@ function writeResumeManifest(input: {
     created_at: input.state.created_at,
   }
   writeFileSync(join(input.loopDir, "loop-manifest.json"), JSON.stringify(manifest, null, 2) + "\n", "utf-8")
+}
+
+function writeRoundResumeManifest(input: {
+  loopDir: string
+  loopID: string
+  sourceLoopDir: string
+  sourceLoopID: string
+  sourceRound: number
+  projectRoot: string
+  planFile: string
+  checkpoint: RoundCheckpointArtifact
+  state: PactState
+}): void {
+  let sourceManifest: Record<string, unknown> = {}
+  try {
+    sourceManifest = JSON.parse(readFileSync(join(input.sourceLoopDir, "loop-manifest.json"), "utf-8"))
+  } catch {
+    sourceManifest = {}
+  }
+  const manifest = {
+    ...sourceManifest,
+    loop_id: input.loopID,
+    project_root: input.projectRoot,
+    plan_file: input.planFile,
+    source_plan_path: join(input.loopDir, "source-plan.md"),
+    resume_mode: "round",
+    resume_source_loop: input.sourceLoopDir,
+    resume_source_loop_id: input.sourceLoopID,
+    resume_source_round: input.sourceRound,
+    resume_checkpoint: artifactPaths(input.sourceLoopDir, input.sourceRound).roundCheckpoint,
+    resume_checkpoint_sha256: sha256Text(
+      readFileSync(artifactPaths(input.sourceLoopDir, input.sourceRound).roundCheckpoint, "utf-8"),
+    ),
+    inherited_worker_rounds: input.checkpoint.state.completed_worker_rounds ?? 0,
+    max_rounds: input.state.max_rounds,
+    next_round: input.state.next_round,
+    current_round_deprecated_alias: input.state.current_round,
+    attempted_worker_rounds: input.state.attempted_worker_rounds,
+    completed_worker_rounds: input.state.completed_worker_rounds,
+    reviewed_worker_rounds: input.state.reviewed_worker_rounds,
+    full_alignment_interval: input.state.full_alignment_interval,
+    session_strategy: input.state.session_strategy,
+    round_boundary: input.state.round_boundary,
+    trajectory_mode: input.state.trajectory_mode,
+    planner_backend: input.state.planner_backend,
+    planner_model: input.state.planner_model,
+    reviewer_backend: input.state.reviewer_backend,
+    reviewer_model: input.state.reviewer_model,
+    worker_backend: input.state.worker_backend,
+    worker_model: input.state.worker_model,
+    worker_config_source: input.state.worker_config_source,
+    verification_enabled: Boolean(input.state.verification_command),
+    verification_command: input.state.verification_command,
+    verification_timeout_ms: input.state.verification_timeout_ms,
+    base_commit: input.checkpoint.base_commit,
+    active_session_id: undefined,
+    active_round_session_id: undefined,
+    created_at: input.state.created_at,
+  }
+  writeFileSync(join(input.loopDir, "loop-manifest.json"), JSON.stringify(manifest, null, 2) + "\n", "utf-8")
+  copyFileSync(
+    artifactPaths(input.sourceLoopDir, input.sourceRound).roundCheckpoint,
+    join(input.loopDir, "resume-source-round-checkpoint.json"),
+  )
 }
 
 function invokeDriverPlanner(
@@ -1253,6 +1633,7 @@ function finalizeRoundAfterRunExit(input: {
     agent: input.agent,
     model: input.model,
   })
+  writeRoundCheckpoint({ loopDir: input.loopDir, round: input.round })
   return readState(input.loopDir)
 }
 
@@ -1267,10 +1648,7 @@ function ensureDriverRoundStartArtifacts(input: {
   const promptPath = join(input.loopDir, `round-${roundName(input.round)}-prompt.md`)
   if (!existsSync(promptPath)) return
   const paths = artifactPaths(input.loopDir, input.round)
-  const sessionID =
-    input.state.session_strategy === "same-session"
-      ? (input.state.active_round_session_id ?? input.state.active_session_id)
-      : undefined
+  const sessionID = input.state.active_round_session_id ?? input.state.active_session_id
   if (!existsSync(paths.roundState)) {
     writeRoundState({
       loopDir: input.loopDir,
@@ -1357,10 +1735,7 @@ function writeNextPromptAfterDriverRound(input: {
   if (!prompt) return
   const promptPath = join(input.loopDir, `round-${roundName(input.state.current_round)}-prompt.md`)
   writeFileSync(promptPath, prompt, "utf-8")
-  const sessionID =
-    input.state.session_strategy === "same-session"
-      ? (input.state.active_round_session_id ?? input.state.active_session_id)
-      : undefined
+  const sessionID = input.state.active_round_session_id ?? input.state.active_session_id
   writeRoundState({
     loopDir: input.loopDir,
     loopID: input.state.loop_id,
@@ -2118,6 +2493,7 @@ export function cliArgs(raw: string[]): {
   verificationTimeoutMs?: number
   resumeLoopDir?: string
   resumeMode?: ResumeMode
+  resumeRound?: number
 } {
   const args = [...raw]
   const parsed: Record<string, string | undefined> = {}
@@ -2155,6 +2531,7 @@ export function cliArgs(raw: string[]): {
     verificationTimeoutMs: parsed["verification-timeout-ms"] ? Number(parsed["verification-timeout-ms"]) : undefined,
     resumeLoopDir: parsed["resume-loop"] ?? env.PACT_RESUME_LOOP_DIR,
     resumeMode: parseResumeMode(parsed["resume-mode"] ?? env.PACT_RESUME_MODE),
+    resumeRound: parseResumeRound(parsed["resume-round"] ?? env.PACT_RESUME_ROUND),
     sessionStrategy: parsed["session-strategy"] === "same-session" ? "same-session" : "new-per-round",
     fullAlignmentInterval: parsed["full-alignment-interval"] ? Number(parsed["full-alignment-interval"]) : undefined,
   }
@@ -2175,7 +2552,15 @@ function parseReviewerBackend(value: string | undefined): ReviewerBackend | unde
 function parseResumeMode(value: string | undefined): ResumeMode | undefined {
   if (value === undefined || value === "") return undefined
   if (value === "round0") return "round0"
+  if (value === "round") return "round"
   throw new Error(`Unsupported PACT resume mode: ${value}`)
+}
+
+function parseResumeRound(value: string | undefined): number | undefined {
+  if (value === undefined || value === "") return undefined
+  const round = Number(value)
+  if (Number.isInteger(round) && round > 0) return round
+  throw new Error(`Invalid PACT resume round: ${value}`)
 }
 
 function defaultVerificationCommand(parsed: Record<string, string | undefined>): string | undefined {

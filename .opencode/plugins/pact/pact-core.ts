@@ -184,6 +184,38 @@ export type ArtifactPaths = {
   roundResult: string
   roundReplayCase: string
   replayCase: string
+  roundCheckpoint: string
+  planPost: string
+  todoPost: string
+  goalTrackerPost: string
+}
+
+export type RoundCheckpointArtifact = {
+  schema: "pact-round-checkpoint/v1"
+  artifact_version: 1
+  loop_id: string
+  round: number
+  next_round: number
+  created_at: string
+  base_commit?: string
+  state: PactState
+  workspace_patch: PatchMetadata
+  round_result: CheckpointFile
+  review_decision?: CheckpointFile
+  ledgers: {
+    plan: CheckpointFile
+    todo: CheckpointFile
+    goal_tracker: CheckpointFile
+  }
+  next_prompt?: CheckpointFile
+  feedback?: CheckpointFile
+  continuation_package?: CheckpointFile
+}
+
+export type CheckpointFile = {
+  path: string
+  sha256: string
+  bytes: number
 }
 
 export type RoundPhase =
@@ -552,6 +584,10 @@ export function artifactPaths(loopDir: string, round: number): ArtifactPaths {
     roundResult: join(loopDir, `${roundPrefix}-result.json`),
     roundReplayCase: join(loopDir, `${roundPrefix}-replay-case.json`),
     replayCase: join(loopDir, "replay-case.json"),
+    roundCheckpoint: join(loopDir, `${roundPrefix}-checkpoint.json`),
+    planPost: join(loopDir, `${roundPrefix}-plan-post.md`),
+    todoPost: join(loopDir, `${roundPrefix}-todo-post.md`),
+    goalTrackerPost: join(loopDir, `${roundPrefix}-goal-tracker-post.md`),
   }
 }
 
@@ -1108,6 +1144,58 @@ export function writeRoundSnapshot(input: {
   }
   writeJsonFile(filePath, artifact)
   return artifact
+}
+
+export function writeRoundCheckpoint(input: {
+  loopDir: string
+  round: number
+  time?: string
+}): RoundCheckpointArtifact {
+  const paths = artifactPaths(input.loopDir, input.round)
+  const state = readState(input.loopDir)
+  const patch = readJsonFile<PatchArtifact>(paths.patchArtifact)
+  const ledgers = [
+    [join(input.loopDir, "plan.md"), paths.planPost],
+    [join(input.loopDir, "todo.md"), paths.todoPost],
+    [join(input.loopDir, "goal-tracker.md"), paths.goalTrackerPost],
+  ] as const
+  for (const [source, target] of ledgers) copyFileSync(source, target)
+  const nextPromptPath = join(input.loopDir, `round-${roundName(state.next_round ?? state.current_round)}-prompt.md`)
+  const feedbackPath = state.last_feedback_path
+  const checkpoint: RoundCheckpointArtifact = {
+    schema: "pact-round-checkpoint/v1",
+    artifact_version: 1,
+    loop_id: state.loop_id,
+    round: input.round,
+    next_round: state.next_round ?? state.current_round,
+    created_at: input.time ?? new Date().toISOString(),
+    base_commit: state.base_commit,
+    state: { ...state },
+    workspace_patch: patch.workspace_patch,
+    round_result: checkpointFile(paths.roundResult),
+    review_decision: existsSync(paths.reviewDecision) ? checkpointFile(paths.reviewDecision) : undefined,
+    ledgers: {
+      plan: checkpointFile(paths.planPost),
+      todo: checkpointFile(paths.todoPost),
+      goal_tracker: checkpointFile(paths.goalTrackerPost),
+    },
+    next_prompt: existsSync(nextPromptPath) ? checkpointFile(nextPromptPath) : undefined,
+    feedback: feedbackPath && existsSync(feedbackPath) ? checkpointFile(feedbackPath) : undefined,
+    continuation_package: existsSync(paths.continuationPackage)
+      ? checkpointFile(paths.continuationPackage)
+      : undefined,
+  }
+  writeJsonFile(paths.roundCheckpoint, stripUndefined(checkpoint))
+  return checkpoint
+}
+
+function checkpointFile(filePath: string): CheckpointFile {
+  const text = readFileSync(filePath, "utf-8")
+  return {
+    path: filePath,
+    sha256: sha256Text(text),
+    bytes: Buffer.byteLength(text, "utf-8"),
+  }
 }
 
 export function writeRoundTrajectory(input: {
@@ -2331,9 +2419,10 @@ export function isProtectedWrite(filePath: string): boolean {
     /\.pact\/loops\/[^/]+\/plan\.md$/.test(normalized) ||
     /\.pact\/loops\/[^/]+\/todo\.md$/.test(normalized) ||
     /\.pact\/loops\/[^/]+\/goal-tracker\.md$/.test(normalized) ||
-    /\.pact\/loops\/[^/]+\/round-\d+-(?:state|context|patch-artifact|verification|continuation-package|review-decision|result|replay-case)\.json$/.test(
+    /\.pact\/loops\/[^/]+\/round-\d+-(?:state|context|patch-artifact|verification|continuation-package|review-decision|result|replay-case|checkpoint)\.json$/.test(
       normalized,
     ) ||
+    /\.pact\/loops\/[^/]+\/round-\d+-(?:plan|todo|goal-tracker)-post\.md$/.test(normalized) ||
     /\.pact\/loops\/[^/]+\/round-\d+-(?:events|workspace|eval|test)\.(?:jsonl|patch)$/.test(normalized) ||
     /\.pact\/loops\/[^/]+\/round-\d+-review\.md$/.test(normalized) ||
     /\.pact\/loops\/[^/]+\/round-\d+-feedback\.md$/.test(normalized) ||
@@ -3585,6 +3674,10 @@ function defaultRoundArtifacts(loopDir: string, round: number): Record<string, s
     review_decision: paths.reviewDecision,
     round_result: paths.roundResult,
     round_replay_case: paths.roundReplayCase,
+    round_checkpoint: paths.roundCheckpoint,
+    plan_post: paths.planPost,
+    todo_post: paths.todoPost,
+    goal_tracker_post: paths.goalTrackerPost,
   }
 }
 
