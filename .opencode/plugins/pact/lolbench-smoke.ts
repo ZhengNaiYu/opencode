@@ -131,6 +131,20 @@ export function mergeOpenCodeConfigContent(input: {
   ])
   return {
     ...existing,
+    agent: {
+      ...(isRecord(existing.agent) ? existing.agent : {}),
+      "pact-specialist": {
+        description: "Read-only PACT specialist for bounded codebase investigation and verification analysis",
+        mode: "subagent",
+        permission: {
+          "*": "deny",
+          glob: "allow",
+          grep: "allow",
+          list: "allow",
+          read: "allow",
+        },
+      },
+    },
     provider,
     plugin,
   }

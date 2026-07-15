@@ -82,6 +82,9 @@ export type PactPluginOptions = {
   codexTimeoutMs?: number
   fullAlignmentInterval?: number
   benchmarkStrictNetwork?: boolean
+  multiAgentPolicy?: "disabled" | "auto"
+  multiAgentAllowedAgents?: string[]
+  multiAgentMaxSubagents?: number
   verificationCommand?: string
   verificationTimeoutMs?: number
 }
@@ -111,6 +114,9 @@ export const PACT_PLUGIN_DEFAULTS = {
   sessionStrategy: "new-per-round" as SessionStrategy,
   roundBoundary: "session_idle" as RoundBoundary,
   trajectoryMode: "full-redact" as TrajectoryMode,
+  multiAgentPolicy: "disabled" as const,
+  multiAgentAllowedAgents: ["pact-specialist"],
+  multiAgentMaxSubagents: 3,
 }
 
 export const PactPlugin: Plugin = async ({ client, directory, worktree }, options?: PactPluginOptions) => {
@@ -118,6 +124,11 @@ export const PactPlugin: Plugin = async ({ client, directory, worktree }, option
   const cfg = { ...PACT_PLUGIN_DEFAULTS, ...options }
   const promptClient: PromptClient = client
   let processingIdle = false
+  const subagentSessions = new Map<string, string>()
+  const pendingSubagents = new Map<
+    string,
+    Array<{ loopDir: string; round: number; callID: string; agent: string; description: string }>
+  >()
 
   return {
     tool: {
@@ -459,10 +470,27 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
     },
 
     event: async ({ event }) => {
+      if (event.type === "session.created") {
+        const info = objectProperty(objectProperty(event, "properties"), "info")
+        const sessionID = objectProperty(info, "id")
+        const parentID = objectProperty(info, "parentID")
+        if (typeof sessionID === "string" && typeof parentID === "string") {
+          const pending = pendingSubagents.get(parentID)?.shift()
+          if (pending) {
+            subagentSessions.set(sessionID, pending.loopDir)
+            updateRoundExecution(pending.loopDir, pending.round, pending.callID, {
+              session_id: sessionID,
+              status: "running",
+            })
+          }
+        }
+        return
+      }
       if (event.type !== "session.idle") return
       if (processingIdle) return
 
       const sessionID = eventSessionID(event)
+      if (sessionID && subagentSessions.has(sessionID)) return
       const loop = findActiveLoop(projectRoot)
       if (!loop) return
 
@@ -901,6 +929,7 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
     "tool.execute.before": async (input, output) => {
       const args = output?.args ?? {}
       const loop =
+        loopForSubagentSession(input.sessionID, subagentSessions) ??
         claimRoundSessionFromExpectedWrite(projectRoot, input.sessionID, input.tool, args) ??
         claimRoundSessionFromFirstWorkerEvent(projectRoot, input.sessionID) ??
         matchingActiveLoop(projectRoot, input.sessionID)
@@ -918,6 +947,36 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
             args: summarizeToolArgs(args),
           },
         })
+      }
+      const subagentLoop = input.sessionID ? subagentSessions.get(input.sessionID) : undefined
+      if (subagentLoop && input.tool === "task") {
+        throw new Error("[PACT] nested subagent delegation is disabled in multi-agent v1.")
+      }
+      if (subagentLoop && (input.tool === "bash" || isFileWriteTool(input.tool))) {
+        throw new Error("[PACT] multi-agent v1 specialists are read-only and cannot use shell or file-write tools.")
+      }
+      if (loop && input.tool === "task") {
+        const block = multiAgentTaskBlock(loop.loopDir, input.sessionID, input.callID, args, cfg)
+        if (block) {
+          appendRoundEvent({
+            loopDir: loop.loopDir,
+            loopID: readState(loop.loopDir).loop_id,
+            round: readState(loop.loopDir).current_round,
+            type: "tool_before",
+            sessionID: input.sessionID,
+            data: { tool: input.tool, call_id: input.callID, status: "blocked", reason: block.reason },
+          })
+          throw new Error(`[PACT] ${block.message}`)
+        }
+        const state = readState(loop.loopDir)
+        const agentValue = objectProperty(args, "subagent_type")
+        const descriptionValue = objectProperty(args, "description")
+        const agent = typeof agentValue === "string" ? agentValue : ""
+        const description = typeof descriptionValue === "string" ? descriptionValue : ""
+        recordRoundExecution(loop.loopDir, state.current_round, input.callID, agent, description)
+        const pending = pendingSubagents.get(input.sessionID) ?? []
+        pending.push({ loopDir: loop.loopDir, round: state.current_round, callID: input.callID, agent, description })
+        pendingSubagents.set(input.sessionID, pending)
       }
       const networkBlock = cfg.benchmarkStrictNetwork ? benchmarkNetworkBlock(input.tool, args) : undefined
       if (networkBlock) {
@@ -1016,7 +1075,8 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
         }
         throw new Error("[PACT] blocked reviewer-only PACT artifact; read only worker-safe PACT artifacts in benchmark mode.")
       }
-      const toolBlock = cfg.benchmarkStrictNetwork ? benchmarkToolBlock(input.tool) : undefined
+      const toolBlock =
+        cfg.benchmarkStrictNetwork && cfg.multiAgentPolicy !== "auto" ? benchmarkToolBlock(input.tool) : undefined
       if (toolBlock) {
         if (loop) {
           const state = readState(loop.loopDir)
@@ -1073,7 +1133,7 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
     },
 
     "tool.execute.after": async (input, output) => {
-      const loop = matchingActiveLoop(projectRoot, input.sessionID)
+      const loop = loopForSubagentSession(input.sessionID, subagentSessions) ?? matchingActiveLoop(projectRoot, input.sessionID)
       if (!loop) return
       const state = readState(loop.loopDir)
       appendRoundEvent({
@@ -1089,6 +1149,9 @@ Goal tracker: ${join(loop.loopDir, "goal-tracker.md")}
           output: summarizeToolOutput(output),
         },
       })
+      if (input.tool === "task") {
+        updateRoundExecution(loop.loopDir, state.current_round, input.callID, { status: "complete" })
+      }
     },
   }
 }
@@ -1204,6 +1267,153 @@ function matchingActiveLoop(projectRoot: string, sessionID?: string) {
   if (!sessionID && state.session_strategy !== "new-per-round") return loop
   if (state.session_strategy === "new-per-round") return undefined
   return loop
+}
+
+function loopForSubagentSession(sessionID: string | undefined, sessions: Map<string, string>) {
+  if (!sessionID) return undefined
+  const loopDir = sessions.get(sessionID)
+  if (!loopDir || !existsSync(loopDir)) return undefined
+  return { loopDir }
+}
+
+type RoundExecution = {
+  schema: "pact-round-execution/v1"
+  artifact_version: 1
+  loop_id: string
+  round: number
+  policy: "auto"
+  mode: "coordinator"
+  workspace_mode: "read_only_specialists"
+  background: false
+  nested_delegation: false
+  calls: Array<{
+    call_id: string
+    agent: string
+    description: string
+    status: "dispatched" | "running" | "complete"
+    session_id?: string
+  }>
+}
+
+function multiAgentTaskBlock(
+  loopDir: string,
+  sessionID: string,
+  callID: string,
+  args: Record<string, unknown>,
+  cfg: PactPluginOptions,
+): { reason: string; message: string } | undefined {
+  if (cfg.multiAgentPolicy !== "auto") {
+    return { reason: "multi_agent_disabled", message: "task/subagent delegation is disabled for this PACT worker." }
+  }
+  if (objectProperty(args, "background") === true) {
+    return {
+      reason: "multi_agent_background_disabled",
+      message: "background subagents are disabled in multi-agent v1; use a foreground task.",
+    }
+  }
+  if (typeof objectProperty(args, "task_id") === "string") {
+    return {
+      reason: "multi_agent_resume_disabled",
+      message: "resuming an existing subagent task is disabled in multi-agent v1; start a fresh foreground specialist.",
+    }
+  }
+  const agent = objectProperty(args, "subagent_type")
+  if (typeof agent !== "string" || !(cfg.multiAgentAllowedAgents ?? PACT_PLUGIN_DEFAULTS.multiAgentAllowedAgents).includes(agent)) {
+    return {
+      reason: "multi_agent_agent_not_allowed",
+      message: `subagent ${JSON.stringify(agent)} is not allowed; use one of ${(cfg.multiAgentAllowedAgents ?? PACT_PLUGIN_DEFAULTS.multiAgentAllowedAgents).join(", ")}.`,
+    }
+  }
+  const state = readState(loopDir)
+  const execution = readRoundExecution(loopDir, state.current_round)
+  if ((execution?.calls.length ?? 0) >= (cfg.multiAgentMaxSubagents ?? PACT_PLUGIN_DEFAULTS.multiAgentMaxSubagents)) {
+    return {
+      reason: "multi_agent_limit_reached",
+      message: `round ${state.current_round} reached the subagent limit of ${cfg.multiAgentMaxSubagents ?? PACT_PLUGIN_DEFAULTS.multiAgentMaxSubagents}.`,
+    }
+  }
+  if (execution?.calls.some((call) => call.call_id === callID)) return undefined
+  if (!sessionID) return { reason: "multi_agent_missing_session", message: "task delegation requires a worker session." }
+  return undefined
+}
+
+function recordRoundExecution(
+  loopDir: string,
+  round: number,
+  callID: string,
+  agent: string,
+  description: string,
+): void {
+  const state = readState(loopDir)
+  const execution = readRoundExecution(loopDir, round) ?? {
+    schema: "pact-round-execution/v1",
+    artifact_version: 1,
+    loop_id: state.loop_id,
+    round,
+    policy: "auto",
+    mode: "coordinator",
+    workspace_mode: "read_only_specialists",
+    background: false,
+    nested_delegation: false,
+    calls: [],
+  }
+  if (!execution.calls.some((call) => call.call_id === callID)) {
+    execution.calls.push({ call_id: callID, agent, description, status: "dispatched" })
+  }
+  writeFileSync(roundExecutionPath(loopDir, round), `${JSON.stringify(execution, null, 2)}\n`, "utf-8")
+}
+
+function updateRoundExecution(
+  loopDir: string,
+  round: number,
+  callID: string,
+  update: { status: "running" | "complete"; session_id?: string },
+): void {
+  const execution = readRoundExecution(loopDir, round)
+  const call = execution?.calls.find((item) => item.call_id === callID)
+  if (!execution || !call) return
+  call.status = update.status
+  if (update.session_id) call.session_id = update.session_id
+  writeFileSync(roundExecutionPath(loopDir, round), `${JSON.stringify(execution, null, 2)}\n`, "utf-8")
+}
+
+function readRoundExecution(loopDir: string, round: number): RoundExecution | undefined {
+  const path = roundExecutionPath(loopDir, round)
+  if (!existsSync(path)) return undefined
+  const value: unknown = JSON.parse(readFileSync(path, "utf-8"))
+  if (!isRecord(value) || value.schema !== "pact-round-execution/v1" || !Array.isArray(value.calls)) return undefined
+  const calls = value.calls.flatMap((item) => {
+    if (!isRecord(item)) return []
+    if (typeof item.call_id !== "string" || typeof item.agent !== "string" || typeof item.description !== "string") {
+      return []
+    }
+    if (item.status !== "dispatched" && item.status !== "running" && item.status !== "complete") return []
+    return [
+      {
+        call_id: item.call_id,
+        agent: item.agent,
+        description: item.description,
+        status: item.status,
+        session_id: typeof item.session_id === "string" ? item.session_id : undefined,
+      },
+    ]
+  })
+  return {
+    schema: "pact-round-execution/v1",
+    artifact_version: 1,
+    loop_id: typeof value.loop_id === "string" ? value.loop_id : "",
+    round: typeof value.round === "number" ? value.round : round,
+    policy: "auto",
+    mode: "coordinator",
+    workspace_mode: "read_only_specialists",
+    background: false,
+    nested_delegation: false,
+    calls,
+  }
+}
+
+function roundExecutionPath(loopDir: string, round: number): string {
+  return join(loopDir, `round-${roundName(round)}-execution.json`)
 }
 
 function claimRoundSessionFromExpectedWrite(

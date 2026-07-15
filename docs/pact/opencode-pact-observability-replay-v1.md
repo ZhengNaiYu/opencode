@@ -1,5 +1,10 @@
 # OpenCode PACT Observability and Replay v1 Design
 
+Companion documents:
+
+- [Round resume design and trust boundaries](./opencode-pact-round-resume-design.md)
+- [Factor-analysis round-resume replay experiment, 2026-07-13](./opencode-pact-round-resume-factor-analysis-replay-2026-07-13.md)
+
 ## Goal
 
 Make each OpenCode PACT round self-explaining, replay-exportable, and governed by a Humanize-style review loop.

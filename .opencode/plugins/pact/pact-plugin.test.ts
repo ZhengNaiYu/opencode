@@ -287,6 +287,22 @@ describe("PACT Codex planner and reviewer", () => {
       failure: null,
       metrics: { patch_lines: patch.workspace_patch.lines },
     })
+    writeFileSync(
+      join(sourceLoop.loopDir, "round-01-execution.json"),
+      `${JSON.stringify({
+        schema: "pact-round-execution/v1",
+        artifact_version: 1,
+        loop_id: sourceLoop.loopID,
+        round: 1,
+        policy: "auto",
+        mode: "coordinator",
+        workspace_mode: "read_only_specialists",
+        background: false,
+        nested_delegation: false,
+        calls: [{ call_id: "call_1", agent: "pact-specialist", status: "complete" }],
+      })}\n`,
+      "utf-8",
+    )
     writeRoundCheckpoint({ loopDir: sourceLoop.loopDir, round: 1 })
 
     const hooks = await PactPlugin({ client: {}, directory: project, worktree: project } as any)
@@ -309,6 +325,7 @@ describe("PACT Codex planner and reviewer", () => {
     expect(state.round_boundary).toBe("session_idle")
     const context = JSON.parse(readFileSync(join(result.metadata.loopDir, "round-02-context.json"), "utf-8"))
     expect(context.session_id).toBe("ses_resume")
+    expect(existsSync(join(result.metadata.loopDir, "round-01-execution.json"))).toBe(true)
     expect(readdirSync(join(project, ".pact", "loops"))).toContain(result.metadata.loopDir.split("/").at(-1))
   })
 
@@ -1458,15 +1475,15 @@ describe("PACT Codex planner and reviewer", () => {
           },
         } as any,
       ),
-    ).rejects.toThrow("blocks task/subagent delegation")
+    ).rejects.toThrow("delegation is disabled")
 
     const events = readFileSync(join(loop.loopDir, "round-01-events.jsonl"), "utf-8")
     expect(events).toContain('"tool":"task"')
     expect(events).toContain('"status":"blocked"')
-    expect(events).toContain('"reason":"benchmark_strict_task_delegation"')
+    expect(events).toContain('"reason":"multi_agent_disabled"')
   })
 
-  test("task delegation remains available outside benchmark strict mode", async () => {
+  test("task delegation remains disabled by default outside benchmark strict mode", async () => {
     const project = tempGitProject()
     createLoop({
       projectRoot: project,
@@ -1482,7 +1499,107 @@ describe("PACT Codex planner and reviewer", () => {
         { tool: "task", callID: "call_task", sessionID: "ses_worker" } as any,
         { args: { description: "parallel analysis", prompt: "Inspect the repository.", subagent_type: "general" } } as any,
       ),
+    ).rejects.toThrow("delegation is disabled")
+  })
+
+  test("multi-agent auto mode allows bounded foreground specialists and records execution", async () => {
+    const project = tempGitProject()
+    const loop = createLoop({
+      projectRoot: project,
+      planFile: "plan.md",
+      workerSessionID: "ses_worker",
+    })
+    const hooks = await PactPlugin({ client: {}, directory: project, worktree: project } as any, {
+      benchmarkStrictNetwork: true,
+      multiAgentPolicy: "auto",
+    })
+    const args = {
+      description: "inspect parser",
+      prompt: "Find the relevant parser implementation and report evidence.",
+      subagent_type: "pact-specialist",
+    }
+
+    await expect(
+      hooks["tool.execute.before"]?.(
+        { tool: "task", callID: "call_task", sessionID: "ses_worker" } as any,
+        { args } as any,
+      ),
     ).resolves.toBeUndefined()
+    await hooks.event?.({
+      event: {
+        type: "session.created",
+        properties: { info: { id: "ses_specialist", parentID: "ses_worker" } },
+      } as any,
+    })
+    await hooks["tool.execute.after"]?.(
+      { tool: "task", callID: "call_task", sessionID: "ses_worker", args } as any,
+      { title: "inspect parser", output: "Findings" } as any,
+    )
+
+    const execution = JSON.parse(readFileSync(join(loop.loopDir, "round-01-execution.json"), "utf-8"))
+    expect(execution).toMatchObject({
+      policy: "auto",
+      mode: "coordinator",
+      workspace_mode: "read_only_specialists",
+      calls: [
+        {
+          call_id: "call_task",
+          agent: "pact-specialist",
+          session_id: "ses_specialist",
+          status: "complete",
+        },
+      ],
+    })
+    await expect(
+      hooks["tool.execute.before"]?.(
+        { tool: "write", callID: "call_write", sessionID: "ses_specialist" } as any,
+        { args: { filePath: "src.txt", content: "bad\n" } } as any,
+      ),
+    ).rejects.toThrow("specialists are read-only")
+    await expect(
+      hooks["tool.execute.before"]?.(
+        { tool: "task", callID: "call_nested", sessionID: "ses_specialist" } as any,
+        { args } as any,
+      ),
+    ).rejects.toThrow("nested subagent delegation")
+  })
+
+  test("multi-agent auto mode rejects background, unknown, and excess specialists", async () => {
+    const project = tempGitProject()
+    createLoop({ projectRoot: project, planFile: "plan.md", workerSessionID: "ses_worker" })
+    const hooks = await PactPlugin({ client: {}, directory: project, worktree: project } as any, {
+      multiAgentPolicy: "auto",
+      multiAgentMaxSubagents: 1,
+    })
+
+    await expect(
+      hooks["tool.execute.before"]?.(
+        { tool: "task", callID: "call_background", sessionID: "ses_worker" } as any,
+        { args: { background: true, subagent_type: "pact-specialist" } } as any,
+      ),
+    ).rejects.toThrow("background subagents are disabled")
+    await expect(
+      hooks["tool.execute.before"]?.(
+        { tool: "task", callID: "call_general", sessionID: "ses_worker" } as any,
+        { args: { subagent_type: "general" } } as any,
+      ),
+    ).rejects.toThrow("is not allowed")
+    await expect(
+      hooks["tool.execute.before"]?.(
+        { tool: "task", callID: "call_resume", sessionID: "ses_worker" } as any,
+        { args: { task_id: "ses_old", subagent_type: "pact-specialist" } } as any,
+      ),
+    ).rejects.toThrow("resuming an existing subagent task is disabled")
+    await hooks["tool.execute.before"]?.(
+      { tool: "task", callID: "call_first", sessionID: "ses_worker" } as any,
+      { args: { description: "first", subagent_type: "pact-specialist" } } as any,
+    )
+    await expect(
+      hooks["tool.execute.before"]?.(
+        { tool: "task", callID: "call_second", sessionID: "ses_worker" } as any,
+        { args: { description: "second", subagent_type: "pact-specialist" } } as any,
+      ),
+    ).rejects.toThrow("reached the subagent limit")
   })
 
   test("ledger protection blocks writes but still allows reading reviewer feedback", async () => {

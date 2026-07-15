@@ -41,6 +41,18 @@ describe("PACT static agent prompts", () => {
     expect(prompt).toContain("broadest coherent objective")
     expect(prompt).toContain("Reviewer guidance is evidence, not assignment")
     expect(prompt).toContain("Why This Objective")
+    expect(prompt).toContain("Decide autonomously whether delegation is worth its cost")
+    expect(prompt).toContain("pact-specialist")
     expect(prompt).not.toMatch(/smallest coherent task/i)
+  })
+
+  test("specialist prompt is read-only and returns evidence to the worker", () => {
+    const prompt = readAgentPrompt("pact-specialist.md")
+
+    expect(prompt).toContain('mode: subagent')
+    expect(prompt).toContain('"*": deny')
+    expect(prompt).toContain("read: allow")
+    expect(prompt).toContain("read-only specialist")
+    expect(prompt).toContain("Do not modify files")
   })
 })

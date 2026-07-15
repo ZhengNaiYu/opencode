@@ -81,6 +81,10 @@ describe("LoLBench ZAI Coding Plan smoke config", () => {
     })
 
     expect(merged.provider?.["zai-coding-plan"]).toBeDefined()
+    expect(merged.agent?.["pact-specialist"]).toMatchObject({
+      mode: "subagent",
+      permission: { "*": "deny", read: "allow" },
+    })
     expect(merged.plugin).toEqual([
       "@scope/existing-plugin",
       ["/existing/plugin.ts", { reviewerBackend: "codex-cli" }],
