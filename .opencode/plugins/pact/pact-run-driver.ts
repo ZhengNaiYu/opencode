@@ -58,6 +58,8 @@ import {
 } from "./pact-core"
 
 const OPENCODE_RUN_MAX_BUFFER = 100 * 1024 * 1024
+const DEFAULT_WORKER_TIMEOUT_MS = 50 * 60 * 1000
+const DEFAULT_OPENCODE_TIMEOUT_MS = 20 * 60 * 1000
 
 type SpawnResult = {
   status: number | null
@@ -69,14 +71,22 @@ type SpawnResult = {
 type SpawnSyncLike = (
   command: string,
   args: string[],
-  options: { cwd: string; input: string; encoding: "utf-8"; stdio: Array<"inherit" | "pipe">; maxBuffer: number },
+  options: {
+    cwd: string
+    input: string
+    encoding: "utf-8"
+    stdio: Array<"inherit" | "pipe">
+    maxBuffer: number
+    timeout?: number
+  },
 ) => SpawnResult
 
 type WorkerRunner = "host" | "docker"
+type WorkerOutputFormat = "text" | "json"
 type ResumeMode = "round0" | "round"
 
 type PactDriverResult = {
-  status: LoopStatus | "no_loop" | "opencode_failed" | "missing_prompt" | "max_invocations"
+  status: LoopStatus | "no_loop" | "opencode_failed" | "worker_timeout" | "missing_prompt" | "max_invocations"
   invocations: number
   loopDir?: string
   round?: number
@@ -149,6 +159,8 @@ export function runPactDriver(input: {
   plannerAgent?: string
   reviewerAgent?: string
   workerAgent?: string
+  workerOpencodeCommand?: string
+  workerOutputFormat?: WorkerOutputFormat
   variant?: string
   workerRunner?: WorkerRunner
   workerContainerImage?: string
@@ -176,9 +188,10 @@ export function runPactDriver(input: {
   const spawn = input.spawnSync ?? defaultSpawnSync
   const maxInvocations = input.maxInvocations ?? input.maxRounds + 4
   const workerRunner = input.workerRunner ?? "host"
+  const workerTimeoutMs = timeoutFromEnv("PACT_WORKER_TIMEOUT_MS", DEFAULT_WORKER_TIMEOUT_MS)
+  const log = input.log ?? console.error
   const workerContainerImage = input.workerContainerImage ?? env.LOLBENCH_AGENT_IMAGE_TAG ?? env.LOLBENCH_IMAGE_TAG
   if (workerRunner === "docker" && !workerContainerImage) {
-    const log = input.log ?? console.error
     log("PACT docker worker runner requires --worker-container-image or LOLBENCH_AGENT_IMAGE_TAG")
     return { status: "opencode_failed", invocations: 0, exitCode: 2 }
   }
@@ -230,12 +243,13 @@ export function runPactDriver(input: {
     const opencodeArgs = buildOpencodeRunArgs({
       model: input.model,
       agent: input.workerAgent ?? input.agent,
+      outputFormat: input.workerOutputFormat,
       variant: input.variant,
       sessionID: sessionStrategy === "same-session" ? sessionID : undefined,
     })
     const invocation = buildWorkerInvocation({
       runner: workerRunner,
-      opencodeCommand: input.opencodeCommand ?? "opencode",
+      opencodeCommand: input.workerOpencodeCommand ?? input.opencodeCommand ?? "opencode",
       dockerCommand: input.dockerCommand ?? "docker",
       containerOpencodeCommand: input.containerOpencodeCommand ?? "opencode",
       opencodeArgs,
@@ -245,18 +259,25 @@ export function runPactDriver(input: {
       workerPluginMount: input.workerPluginMount,
       workerContainerPluginMount: input.workerContainerPluginMount ?? "/opt/opencode-pact-plugins",
     })
+    log(`[PACT] starting worker round ${invokedRound} (timeout=${workerTimeoutMs}ms)`)
     const result = spawn(invocation.command, invocation.args, {
       cwd: projectRoot,
       input: nextPrompt,
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
       maxBuffer: OPENCODE_RUN_MAX_BUFFER,
+      timeout: workerTimeoutMs,
     })
     invocations++
+    log(`[PACT] worker round ${invokedRound} exited (status=${result.status ?? "unknown"})`)
     if (result.error || result.status !== 0) {
-      const log = input.log ?? console.error
       log(formatOpenCodeFailure({ command: invocation.command, args: invocation.args, result }))
-      return { status: "opencode_failed", invocations, exitCode: result.status ?? 1 }
+      const timedOut = result.status === 124 || spawnTimedOut(result)
+      return {
+        status: timedOut ? "worker_timeout" : "opencode_failed",
+        invocations,
+        exitCode: timedOut ? 124 : (result.status ?? 1),
+      }
     }
 
     let state = readState(loopDir)
@@ -1185,6 +1206,7 @@ function invokeDriverOpenCodeAgent(
     encoding: "utf-8",
     stdio: ["pipe", "pipe", "pipe"],
     maxBuffer: OPENCODE_RUN_MAX_BUFFER,
+    timeout: timeoutFromEnv("PACT_OPENCODE_TIMEOUT_MS", DEFAULT_OPENCODE_TIMEOUT_MS),
   })
   if (result.error) throw result.error
   if (result.status !== 0) {
@@ -1293,6 +1315,19 @@ function formatOpenCodeFailure(input: { command: string; args: string[]; result:
     input.result.stderr ? `stderr:\n${input.result.stderr}` : undefined,
   ].filter((line): line is string => Boolean(line))
   return truncateLog(redactText(parts.join("\n")), 6000)
+}
+
+function spawnTimedOut(result: SpawnResult): boolean {
+  if (!result.error) return false
+  const code = (result.error as Error & { code?: string }).code
+  return code === "ETIMEDOUT" || /timed out|ETIMEDOUT/i.test(String(result.error))
+}
+
+function timeoutFromEnv(name: string, fallback: number): number {
+  const raw = env[name]
+  if (!raw) return fallback
+  const value = Number(raw)
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback
 }
 
 function truncateLog(text: string, maxLength: number): string {
@@ -2447,11 +2482,13 @@ function dockerBlackholeHostArgs(): string[] {
 function buildOpencodeRunArgs(input: {
   model: string
   agent?: string
+  outputFormat?: WorkerOutputFormat
   variant?: string
   sessionID?: string
 }): string[] {
   const args = ["run", "--dangerously-skip-permissions", "-m", input.model]
   if (input.agent) args.push("--agent", input.agent)
+  if (input.outputFormat === "json") args.push("--format", "json", "--thinking")
   if (input.variant) args.push("--variant", input.variant)
   if (input.sessionID) args.push("-s", input.sessionID)
   return args
@@ -2460,7 +2497,14 @@ function buildOpencodeRunArgs(input: {
 function defaultSpawnSync(
   command: string,
   args: string[],
-  options: { cwd: string; input: string; encoding: "utf-8"; stdio: Array<"inherit" | "pipe">; maxBuffer: number },
+  options: {
+    cwd: string
+    input: string
+    encoding: "utf-8"
+    stdio: Array<"inherit" | "pipe">
+    maxBuffer: number
+    timeout?: number
+  },
 ): SpawnResult {
   return nodeSpawnSync(command, args, options)
 }
@@ -2477,6 +2521,8 @@ export function cliArgs(raw: string[]): {
   plannerAgent?: string
   reviewerAgent?: string
   workerAgent?: string
+  workerOpencodeCommand?: string
+  workerOutputFormat?: WorkerOutputFormat
   variant?: string
   workerRunner?: WorkerRunner
   workerContainerImage?: string
@@ -2517,6 +2563,8 @@ export function cliArgs(raw: string[]): {
     plannerAgent: parsed["planner-agent"],
     reviewerAgent: parsed["reviewer-agent"],
     workerAgent: parsed["worker-agent"] ?? parsed.agent,
+    workerOpencodeCommand: parsed["worker-opencode-command"],
+    workerOutputFormat: parseWorkerOutputFormat(parsed["worker-output-format"]),
     variant: parsed.variant,
     workerRunner: (parsed["worker-runner"] ?? env.PACT_WORKER_RUNNER) === "docker" ? "docker" : "host",
     workerContainerImage: parsed["worker-container-image"] ?? env.LOLBENCH_AGENT_IMAGE_TAG,
@@ -2547,6 +2595,12 @@ function parseReviewerBackend(value: string | undefined): ReviewerBackend | unde
   if (value === undefined || value === "") return undefined
   if (value === "opencode-cli" || value === "codex-cli") return value
   throw new Error(`Unsupported PACT reviewer backend: ${value}`)
+}
+
+function parseWorkerOutputFormat(value: string | undefined): WorkerOutputFormat | undefined {
+  if (value === undefined || value === "") return undefined
+  if (value === "text" || value === "json") return value
+  throw new Error(`Unsupported PACT worker output format: ${value}`)
 }
 
 function parseResumeMode(value: string | undefined): ResumeMode | undefined {

@@ -1,0 +1,40 @@
+task:
+  path: /Users/naiyu/Desktop/Code/CodingAgent/harbor/datasets/swepro-evolution/instance_ansible__ansible-1c06c46cc14324df35ac4f39a45fb3ccd602195d-v0f01c69f1e2528b935359cfe578530722bca2c59
+
+trial_name: ansible-direct-smoke
+
+agent:
+  import_path: pact_harbor.agent:OpenCodeObserved
+  model_name: yunwu/gpt-5.6-sol
+  override_timeout_sec: 21600
+  override_setup_timeout_sec: 1800
+  network_mode: allowlist
+  allowed_hosts:
+    - yunwu.ai
+  env:
+    YUNWU_API_KEY: ${YUNWU_API_KEY}
+  kwargs:
+    version: "1.17.13"
+    variant: xhigh
+    opencode_config:
+      model: yunwu/gpt-5.6-sol
+      small_model: yunwu/gpt-5.6-sol
+      provider:
+        yunwu:
+          name: Yunwu
+          api: openai
+          options:
+            baseURL: https://yunwu.ai/v1
+            apiKey: "{env:YUNWU_API_KEY}"
+          models:
+            gpt-5.6-sol:
+              options:
+                reasoningEffort: xhigh
+              variants:
+                xhigh:
+                  reasoningEffort: xhigh
+
+environment:
+  type: docker
+  force_build: false
+  delete: true

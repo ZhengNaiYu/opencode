@@ -1,0 +1,12 @@
+task:
+  path: /Users/naiyu/Desktop/Code/CodingAgent/harbor/datasets/swepro-evolution/instance_ansible__ansible-1c06c46cc14324df35ac4f39a45fb3ccd602195d-v0f01c69f1e2528b935359cfe578530722bca2c59
+
+trial_name: ansible-oracle-smoke
+
+agent:
+  name: oracle
+
+environment:
+  type: docker
+  force_build: false
+  delete: true

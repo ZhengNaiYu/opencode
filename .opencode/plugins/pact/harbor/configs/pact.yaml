@@ -1,0 +1,30 @@
+job_name: swepro-evolution-opencode-pact
+n_attempts: 1
+n_concurrent_trials: 1
+quiet: false
+
+retry:
+  max_retries: 0
+
+environment:
+  type: docker
+  force_build: false
+  delete: true
+
+agents:
+  - import_path: pact_harbor.agent:OpenCodePACT
+    model_name: yunwu/claude-opus-4-8
+    override_timeout_sec: 21600
+    override_setup_timeout_sec: 1800
+    network_mode: allowlist
+    allowed_hosts:
+      - yunwu.ai
+    env:
+      YUNWU_API_KEY: ${YUNWU_API_KEY}
+    kwargs:
+      version: "1.17.13"
+      max_rounds: 3
+      opencode_root: /Users/naiyu/Desktop/Code/CodingAgent/opencode
+
+datasets:
+  - path: /Users/naiyu/Desktop/Code/CodingAgent/harbor/datasets/swepro-evolution

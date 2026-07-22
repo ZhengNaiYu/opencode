@@ -159,6 +159,23 @@ describe("PACT run driver", () => {
     expect(parsed.reviewerModel).toBe("gpt-5.5")
   })
 
+  test("parses JSON worker output for observable Harbor runs", () => {
+    const parsed = cliArgs([
+      "--plan-file",
+      "/tmp/PROMPT.md",
+      "--worker-output-format",
+      "json",
+      "--worker-opencode-command",
+      "/opt/opencode-observed",
+    ])
+
+    expect(parsed.workerOutputFormat).toBe("json")
+    expect(parsed.workerOpencodeCommand).toBe("/opt/opencode-observed")
+    expect(() =>
+      cliArgs(["--plan-file", "/tmp/PROMPT.md", "--worker-output-format", "xml"]),
+    ).toThrow("Unsupported PACT worker output format: xml")
+  })
+
   test("rejects OpenRouter chat as a planner or reviewer backend", () => {
     expect(() =>
       cliArgs([
@@ -301,7 +318,7 @@ describe("PACT run driver", () => {
 
   test("starts a fresh OpenCode session for the finalize follow-up by default", () => {
     const project = tempGitProject()
-    const calls: Array<{ command: string; args: string[]; input: string; maxBuffer?: number }> = []
+    const calls: Array<{ command: string; args: string[]; input: string; maxBuffer?: number; timeout?: number }> = []
     let loopDir = ""
 
     const result = runPactDriver({
@@ -316,7 +333,13 @@ describe("PACT run driver", () => {
         return validPlannerOutput()
       },
       spawnSync(command, args, options) {
-        calls.push({ command, args, input: options.input, maxBuffer: options.maxBuffer })
+        calls.push({
+          command,
+          args,
+          input: options.input,
+          maxBuffer: options.maxBuffer,
+          timeout: options.timeout,
+        })
         if (calls.length === 1) {
           const state = readState(loopDir)
           state.phase = "finalize"
@@ -342,11 +365,42 @@ describe("PACT run driver", () => {
     expect(calls[0]?.args).toEqual(["run", "--dangerously-skip-permissions", "-m", "zai-coding-plan/glm-5-turbo"])
     expect(calls[0]?.input).toContain("# PACT Round 01")
     expect(calls[0]?.maxBuffer).toBeGreaterThanOrEqual(50 * 1024 * 1024)
+    expect(calls[0]?.timeout).toBeGreaterThan(0)
     expect(calls[1]?.args).toEqual(["run", "--dangerously-skip-permissions", "-m", "zai-coding-plan/glm-5-turbo"])
     expect(calls[1]?.input).toBe("finalize phase prompt\n")
     expect(existsSync(join(loopDir, "round-01-trajectory.json"))).toBe(true)
     expect(readFileSync(join(loopDir, "round-01-trajectory.json"), "utf-8")).toContain("worker log")
     expect(readFileSync(join(loopDir, "round-01-trajectory.json"), "utf-8")).not.toContain("secret-value")
+  })
+
+  test("classifies a worker wrapper timeout without entering review", () => {
+    const project = tempGitProject()
+    const logs: string[] = []
+
+    const result = runPactDriver({
+      projectRoot: project,
+      planFile: join(project, "plan.md"),
+      model: "zai-coding-plan/glm-5-turbo",
+      maxRounds: 1,
+      planner() {
+        return validPlannerOutput()
+      },
+      reviewer() {
+        throw new Error("reviewer must not run after a worker timeout")
+      },
+      spawnSync() {
+        return { status: 124, stdout: "", stderr: "observed-run timeout" }
+      },
+      log(message) {
+        logs.push(message)
+      },
+    })
+
+    expect(result.status).toBe("worker_timeout")
+    expect(result.exitCode).toBe(124)
+    expect(result.invocations).toBe(1)
+    expect(logs.some((line) => line.includes("starting worker round 1"))).toBe(true)
+    expect(logs.some((line) => line.includes("status=124"))).toBe(true)
   })
 
   test("driver owns Round00 initialization before the first worker run", () => {
@@ -645,6 +699,7 @@ Continue source changes.
       reviewerAgent: "pact-reviewer",
       reviewerModel: "openrouter/z-ai/glm-5.2",
       workerAgent: "pact-worker",
+      workerOutputFormat: "json",
       spawnSync(_command, args, options) {
         calls.push({ args, input: options.input })
         if (calls.length === 1) {
@@ -675,6 +730,9 @@ Continue source changes.
       "openrouter/z-ai/glm-5.2",
       "--agent",
       "pact-worker",
+      "--format",
+      "json",
+      "--thinking",
     ])
     expect(calls[2]?.args).toEqual([
       "run",
